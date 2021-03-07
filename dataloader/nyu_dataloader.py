@@ -7,14 +7,16 @@ from skimage import io, transform
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+from model import fc_basefunction as fc
+
 
 local_pos = "/media/nickle/WD_BLUE/NYUDataV2"
 server_pos = "../SSD"
 use_pos = local_pos
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class Rescale(object):
-
     def __init__(self, output_size):
         assert isinstance(output_size, tuple)
         self.output_size = output_size
@@ -30,28 +32,7 @@ class Rescale(object):
         return {'rgb_img': rgb_img, 'disp_gt': disp_gt}
 
 
-# class Rescale(object):
-#     def __init__(self, output_size):
-#         assert isinstance(output_size, (int, tuple))
-#         self.output_size = output_size
-
-#     def __call__(self, sample):
-#         left_img, disp_gt = sample['left_img'], sample['disp_gt']
-
-#         if isinstance(self.output_size, tuple):
-#             new_h, new_w = self.output_size
-#             h_bias = random.randint(0, 316)
-#             w_bias = random.randint(0, 736)
-#             left_img = left_img[:, h_bias:(new_h+h_bias), w_bias:(new_w+w_bias)]
-#             disp_gt = disp_gt[:, h_bias:(new_h+h_bias), w_bias:(new_w+w_bias)]
-#         else:
-#             print("Error!!! Please input a tuple!")
-        
-#         return {'left_img':left_img, 'disp_gt':disp_gt}
-
-
 class ToTensor(object):
-
     def __call__(self, sample):
         rgb_img, disp_gt = sample['rgb_img'], sample['disp_gt']
 
@@ -60,8 +41,26 @@ class ToTensor(object):
                 'disp_gt': torch.from_numpy(disp_gt).unsqueeze(0)}
 
 
+class SamplePoint(object):
+    def __init__(self, reso, sample_):
+        self.resolution = reso
+        self.sample_ = sample_
+
+    def __call__(self, sample):
+        point_sample_index = random.sample([[i, j] for i in range(self.resolution[0]) for j in range(self.resolution[1])], self.sample_)
+        point_sample_index = sorted(point_sample_index)
+        rgb_img, disp_gt = sample['rgb_img'], sample['disp_gt']
+
+        depth_sample_whole = torch.zeros_like(disp_gt)
+        for p in point_sample_index:
+            depth_sample_whole[:, p[0], p[1]] = disp_gt[:, p[0], p[1]]
+
+        return {'rgb_img':rgb_img, 'disp_gt':disp_gt, 
+                'point_sample_index':point_sample_index, 'depth_sample_whole':depth_sample_whole}
+
+
 class NYUDataset(Dataset):
-    def __init__(self, transform=None):
+    def __init__(self, transform):
         self.transform = transform
 
     def __len__(self):
