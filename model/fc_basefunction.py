@@ -1,4 +1,3 @@
-from numpy.lib.arraypad import pad
 from numpy.lib.index_tricks import AxisConcatenator
 import torch
 from torch import nn
@@ -136,7 +135,26 @@ class FC_basefunction(nn.Module):
         hidden_2_out = hidden_2_out + hidden_1_out
 
         out = self.layer3(hidden_2_out)
-
         out = torch.sin(out)
+
+        return out
+
+
+class FinalUpsample(nn.Module):
+    def __init__(self, resolution, reso_scale2, reso_scale4):
+        super(FinalUpsample, self).__init__()
+        self.upsample_1 = torch.nn.Upsample(size=(resolution[0], resolution[1]), mode="bilinear", align_corners=True)
+
+        self.layer1 = nn.Sequential(
+            nn.Conv2d(in_channels=3, out_channels=1, kernel_size=1)
+            # nn.BatchNorm2d(1),
+            # nn.Tanh()
+        )
+
+    def forward(self, full, scale_2, scale_4):
+        scale_2_up = self.upsample_1(scale_2)
+        scale_4_up = self.upsample_1(scale_4)
+        concat = torch.cat((full, scale_2_up, scale_4_up), dim=1)
+        out = self.layer1(concat)
 
         return out
