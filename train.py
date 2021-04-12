@@ -3,12 +3,14 @@
 import torch
 import time
 import os
-import cv2
 import math
+from tqdm import tqdm
 import numpy as np
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tensorboardX import SummaryWriter
+from torchvision.transforms.transforms import RandomCrop
 
 from dataloader import flying3d_dataloader as fly
 from dataloader import nyu_dataloader as nyu
@@ -18,29 +20,69 @@ from model import fc_basefunction as fc
 batch_num = 1
 shuffle_bool = False
 eval_bool = True
-train_pics = 1200
-eval_pics = 248
-total_epochs = 50000
-sample_num = 1000
+train_pics = 47584
+eval_pics = 654
+total_epochs = 200
+sample_num = 400
 final_layer = 256 # also in other files
 feature_map_layers = 256
-resolution = (240, 320)
-reso_scale2 = (120, 160)
-reso_scale4 = (64, 88)
+resolution = (120, 160)
+raw_resolution = (480, 640)
+reso_scale2 = (240, 320)
+reso_scale4 = (120, 160)
+reso_scale8 = (60, 80)
 lamda1 = 1 # loss_1
 lamda2 = 1 # loss_2
-berHu_thredshold = 0.1
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-run_file_name = "test"
+run_file_name = "finetune_resnet"
+data_gain_bool = True
 
 # define loss function
 # loss_function = torch.nn.SmoothL1Loss(beta=0.001)
-loss_function = torch.nn.L1Loss()
+# loss_function = torch.nn.L1Loss()
+# l2_loss_function = torch.nn.MSELoss()
 
-upsample_visual = torch.nn.Upsample(size=(resolution[0], resolution[1]), mode="bilinear", align_corners=True)
+class LossFunction(torch.nn.Module):
+    def __init__(self):
+        super(LossFunction, self).__init__()
+        self.loss_function = torch.nn.L1Loss()
+    
+    def forward(self, gt, predict):
+        mask = gt > 0
+        loss = self.loss_function(gt[mask], predict[mask])
+
+        return loss
+
+
+upsample_visual = torch.nn.Upsample(size=reso_scale2, mode="bilinear", align_corners=True)
+
+cm = plt.get_cmap('plasma')
+
+class Sobel(torch.nn.Module):
+    def __init__(self):
+        super(Sobel, self).__init__()
+        self.edge_conv = torch.nn.Conv2d(1, 2, kernel_size=3, stride=1, padding=1, bias=False)
+        edge_kx = np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]])
+        edge_ky = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]])
+        edge_k = np.stack((edge_kx, edge_ky))
+
+        edge_k = torch.from_numpy(edge_k).float().view(2, 1, 3, 3)
+        self.edge_conv.weight = torch.nn.Parameter(edge_k)
+
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def forward(self, x):
+        out = self.edge_conv(x) 
+        out = out.contiguous().view(-1, 2, x.size(2), x.size(3))
+  
+        return out
+
+get_gradient = Sobel().to(device)
+cos = torch.nn.CosineSimilarity(dim=1, eps=0)
 
 def position_encoding(tensor):
     x, y = torch.split(tensor, 1, dim=1)
@@ -48,23 +90,78 @@ def position_encoding(tensor):
     #                     torch.sin((2**0)*math.pi*y), torch.cos((2**0)*math.pi*y)), dim=1)
     encoded = torch.cat((x, x, y, y), dim=1)
     for i in range(4):
-        # encoded = torch.cat((encoded, 
-        #                     torch.sin((2**(i))*math.pi*x), torch.cos((2**(i))*math.pi*x),
-        #                     torch.sin((2**(i))*math.pi*y), torch.cos((2**(i))*math.pi*y)), dim=1)
+        encoded = torch.cat((encoded, 
+                            torch.sin((2**(i))*math.pi*x), torch.cos((2**(i))*math.pi*x),
+                            torch.sin((2**(i))*math.pi*y), torch.cos((2**(i))*math.pi*y)), dim=1)
 
-        encoded = torch.cat((encoded, x, x, y, y), dim=1)
+        # encoded = torch.cat((encoded, x, x, y, y), dim=1)
 
     return encoded.permute(0, 2, 1)
 
 
-def berHu_loss(tensor1, tensor2, c):
-    diff = torch.abs(tensor1 - tensor2)
-    berhu = (diff**2 + c**2) / (2*c)
-    mask = diff <= c
-    mask_ = diff > c
-    loss = diff * mask + berhu * mask_
+def evaluation(gt, predict_depth, t_valid):
+    with torch.no_grad():
+        pred_inv = 1.0 / (predict_depth + 1e-8)
+        gt_inv = 1.0 / (gt + 1e-8)
 
-    return loss.sum() / tensor1.numel()
+        # For numerical stability
+        mask = gt > t_valid
+        num_valid = mask.sum()
+
+        pred = predict_depth[mask]
+        gt = gt[mask]
+
+        pred_inv = pred_inv[mask]
+        gt_inv = gt_inv[mask]
+
+        pred_inv[pred <= t_valid] = 0.0
+        gt_inv[gt <= t_valid] = 0.0
+
+        # RMSE / MAE
+        diff = pred - gt
+        diff_abs = torch.abs(diff)
+        diff_sqr = torch.pow(diff, 2)
+
+        rmse = diff_sqr.sum() / (num_valid + 1e-8)
+        rmse = torch.sqrt(rmse)
+
+        mae = diff_abs.sum() / (num_valid + 1e-8)
+
+        # iRMSE / iMAE
+        diff_inv = pred_inv - gt_inv
+        diff_inv_abs = torch.abs(diff_inv)
+        diff_inv_sqr = torch.pow(diff_inv, 2)
+
+        irmse = diff_inv_sqr.sum() / (num_valid + 1e-8)
+        irmse = torch.sqrt(irmse)
+
+        imae = diff_inv_abs.sum() / (num_valid + 1e-8)
+
+        # Rel
+        rel = diff_abs / (gt + 1e-8)
+        rel = rel.sum() / (num_valid + 1e-8)
+
+        # delta
+        r1 = gt / (pred + 1e-8)
+        r2 = pred / (gt + 1e-8)
+        ratio = torch.max(r1, r2)
+
+        del_1 = (ratio < 1.25).type_as(ratio)
+        del_2 = (ratio < 1.25**2).type_as(ratio)
+        del_3 = (ratio < 1.25**3).type_as(ratio)
+
+        del_1 = del_1.sum() / (num_valid + 1e-8)
+        del_2 = del_2.sum() / (num_valid + 1e-8)
+        del_3 = del_3.sum() / (num_valid + 1e-8)
+
+        return {'rmse': rmse, 
+                'mae': mae, 
+                'irmse': irmse, 
+                'imae': imae, 
+                'rel': rel, 
+                'del_1': del_1, 
+                'del_2': del_2, 
+                'del_3': del_3}
 
 
 def least_squres(tensor_a, tensor_b):
@@ -82,40 +179,36 @@ def train_main_loop(dataloader, feature_ex_net, base_func, feature_ex_net_optimi
 
     for i in range(train_pics):
         time_start = time.time()
-        sample_dict = next(it)
+        try:
+            sample_dict = next(it)
+        except:
+            continue
 
         # prepare the data
         rgb_img = sample_dict['rgb_img']
-        # rgb_img_scale2 = sample_dict['rgb_img_scale2']
-        # rgb_img_scale4 = sample_dict['rgb_img_scale4']
         disp_gt = sample_dict['disp_gt']
         point_sample_index = sample_dict['point_sample_index']
         depth_sample_whole = sample_dict['depth_sample_whole'] # not-sampled points are zero, size as disp_gt
         index_list = sample_dict['index_list']
 
         rgb_img = rgb_img.to(device, torch.float32)
-        # rgb_img_scale2 = rgb_img_scale2.to(device, torch.float32)
-        # rgb_img_scale4 = rgb_img_scale4.to(device, torch.float32)
         disp_gt = disp_gt.to(device, torch.float32)
         depth_sample_whole = depth_sample_whole.to(device, torch.float32)
-        index_list = index_list.squeeze(0).to(device, torch.float32)
+        index_list = index_list.to(device, torch.float32)
+        point_sample_index = point_sample_index.to(device, torch.float32)
         depth_sample_whole_copy = depth_sample_whole
 
-        sample_mask = depth_sample_whole > 0
+        disp_gt = torch.autograd.Variable(disp_gt)
+
+        sample_mask = depth_sample_whole >= 0
         depth_sample = torch.masked_select(depth_sample_whole, sample_mask).reshape(sample_num, 1)
 
         feature_map = feature_ex_net(rgb_img) # 1*256*resolution*resolution
-        # feature_map_scale2 = feature_ex_net(rgb_img_scale2)
-        # feature_map_scale4 = feature_ex_net(rgb_img_scale4)
 
         feature_map_sample = torch.masked_select(feature_map, sample_mask) # 256000
         feature_map_sample = feature_map_sample.reshape(1, feature_map_layers, sample_num).permute(0, 2, 1) # 1*1000*256
 
-        # point_sample_index_norm ： 1*2*sample_num
-        point_sample_index_norm = torch.from_numpy(np.array(point_sample_index, dtype=np.float32).transpose(1, 0))
-        point_sample_index_norm = point_sample_index_norm.to(device, dtype=torch.float32) / \
-                                    torch.tensor([[resolution[0]], [resolution[1]]]).to(device, dtype=torch.float32)
-        point_sample_index_norm = point_sample_index_norm.unsqueeze(0).to(device, dtype=torch.float32)
+        point_sample_index_norm = point_sample_index / torch.tensor([[resolution[0]], [resolution[1]]]).to(device, dtype=torch.float32)
 
         fc_in = torch.cat((feature_map_sample, position_encoding(point_sample_index_norm)), dim=2) # 1*1000*(256+40)
         fc_in = fc_in.to(device).squeeze()
@@ -134,64 +227,58 @@ def train_main_loop(dataloader, feature_ex_net, base_func, feature_ex_net_optimi
 
         # predict depth using W
         feature_map = feature_map.reshape(1, feature_map_layers, resolution[0]*resolution[1]).permute(0, 2, 1)
-        # feature_map_scale2 = feature_map_scale2.reshape \
-        #                     (1, feature_map_layers, (reso_scale2[0])*(reso_scale2[1])).permute(0, 2, 1)
-        # feature_map_scale4 = feature_map_scale4.reshape \
-        #                     (1, feature_map_layers, (reso_scale4[0])*(reso_scale4[1])).permute(0, 2, 1)
 
-        # index_list = np.array([[i / resolution[0], j / resolution[1]] \
-        #                     for i in range(resolution[0]) for j in range(resolution[1])]).transpose(1, 0)
-        # index_list = torch.from_numpy(index_list).unsqueeze(0).to(device, torch.float32)
-
-        # index_list_scale2 = np.array([[i / (reso_scale2[0]), j / (reso_scale2[1])] \
-        #                     for i in range(reso_scale2[0]) for j in range(reso_scale2[1])]).transpose(1, 0)
-        # index_list_scale2 = torch.from_numpy(index_list_scale2).unsqueeze(0).to(device, torch.float32)
-
-        # index_list_scale4 = np.array([[i / (reso_scale4[0]), j / (reso_scale4[1])] \
-        #                     for i in range(reso_scale4[0]) for j in range(reso_scale4[1])]).transpose(1, 0)
-        # index_list_scale4 = torch.from_numpy(index_list_scale4).unsqueeze(0).to(device, torch.float32)
-
+        index_list = index_list / torch.tensor([[resolution[0]], [resolution[1]]]).to(device, dtype=torch.float32)
         fc_pic_in = torch.cat((feature_map, position_encoding(index_list)), axis=2).squeeze()
-        # fc_pic_in_scale2 = torch.cat((feature_map_scale2, \
-        #                         position_encoding(index_list_scale2)), axis=2).squeeze()
-        # fc_pic_in_scale4 = torch.cat((feature_map_scale4, \
-        #                         position_encoding(index_list_scale4)), axis=2).squeeze()
         fc_pic_out = base_func(fc_pic_in)
-        # fc_pic_out_scale2 = base_func(fc_pic_in_scale2)
-        # fc_pic_out_scale4 = base_func(fc_pic_in_scale4)
 
         # add pose again
         fc_pic_out = torch.cat((fc_pic_out, position_encoding(index_list).squeeze()), dim=1)
 
         predict_depth = torch.matmul(fc_pic_out, w).reshape(1, 1, resolution[0], resolution[1])
 
-        # multi-scale
-        # predict_depth_scale2 = torch.matmul(fc_pic_out_scale2, w).reshape(1, 1, reso_scale2[0], reso_scale2[1])
-        # predict_depth_scale4 = torch.matmul(fc_pic_out_scale4, w).reshape(1, 1, reso_scale4[0], reso_scale4[1])
-        # final_predict = final_up_net(predict_depth, predict_depth_scale2, predict_depth_scale4)
-        # predict_depth_scale2 = upsample_visual(predict_depth_scale2)
-        # predict_depth_scale4 = upsample_visual(predict_depth_scale4)
+        mask = disp_gt > 0
+        loss_2_smooth = loss_function(predict_depth[mask], disp_gt[mask])
 
-        loss_2_smooth = loss_function(predict_depth, disp_gt)
+        # add gradient loss
+        depth_grad = get_gradient(disp_gt)
+        output_grad = get_gradient(predict_depth)
+        depth_grad_dx = depth_grad[:, 0, :, :].contiguous().view_as(disp_gt)
+        depth_grad_dy = depth_grad[:, 1, :, :].contiguous().view_as(disp_gt)
+        output_grad_dx = output_grad[:, 0, :, :].contiguous().view_as(disp_gt)
+        output_grad_dy = output_grad[:, 1, :, :].contiguous().view_as(disp_gt)
 
-        loss = lamda1 * loss_1_smooth + lamda2 * loss_2_smooth
+        loss_dx = torch.log(torch.abs(output_grad_dx - depth_grad_dx) + 1).mean()
+        loss_dy = torch.log(torch.abs(output_grad_dy - depth_grad_dy) + 1).mean()
+
+        ones = torch.ones_like(disp_gt).float().to(device)
+        ones = torch.autograd.Variable(ones)
+        depth_normal = torch.cat((-depth_grad_dx, -depth_grad_dy, ones), 1)
+        output_normal = torch.cat((-output_grad_dx, -output_grad_dy, ones), 1)
+        loss_normal = torch.abs(1 - cos(output_normal, depth_normal)).mean()
+
+        loss = lamda1 * loss_1_smooth + lamda2 * loss_2_smooth + (loss_dx + loss_dy + loss_normal)
 
         base_func_optimizer.zero_grad()
         feature_ex_net_optimizer.zero_grad()
-        # final_up_net_optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(base_func.parameters(), 10)
         torch.nn.utils.clip_grad_norm_(feature_ex_net.parameters(), 10)
-        # torch.nn.utils.clip_grad_norm_(final_up_net.parameters(), 10)
         base_func_optimizer.step()
         feature_ex_net_optimizer.step()
-        # final_up_net_optimizer.step()
 
-        disp_gt = disp_gt.squeeze().cpu().detach().numpy()
-        predict_depth = predict_depth.squeeze().cpu().detach().numpy()
-        # predict_depth_scale2 = predict_depth_scale2.squeeze().cpu().detach().numpy()
-        # predict_depth_scale4 = predict_depth_scale4.squeeze().cpu().detach().numpy()
-        depth_sample_whole_copy = depth_sample_whole_copy.squeeze().cpu().detach().numpy()
+        # nyudepthv2 visualization
+        disp_gt = disp_gt / 10
+        disp_gt = disp_gt.squeeze().detach().cpu().numpy()
+        disp_gt = (255.0*cm(disp_gt)).astype('uint8')
+
+        predict_depth = predict_depth / 10
+        predict_depth = predict_depth.squeeze().detach().cpu().numpy()
+        predict_depth = (255.0*cm(predict_depth)).astype('uint8')
+
+        depth_sample_whole_copy = depth_sample_whole_copy / 10
+        depth_sample_whole_copy = depth_sample_whole_copy.squeeze().detach().cpu().numpy()
+        depth_sample_whole_copy = (255.0*cm(depth_sample_whole_copy)).astype('uint8')
 
         writer1.add_scalar('loss', loss.item(), global_step=i+train_pics*epoch)
         writer1.add_scalar('loss_1', loss_1_smooth.item(), global_step=i+train_pics*epoch)
@@ -199,11 +286,12 @@ def train_main_loop(dataloader, feature_ex_net, base_func, feature_ex_net_optimi
 
         if (i % 10 == 0):
             writer1.add_image('groundtruth and out', 
-                np.concatenate((disp_gt, predict_depth, depth_sample_whole_copy), axis=1, out=None),
+                np.concatenate((disp_gt, predict_depth, depth_sample_whole_copy), axis=1),
+                # np.concatenate((disp_gt, predict_depth, depth_sample_whole_copy), axis=1, out=None),
                 # np.concatenate((disp_gt, predict_depth, predict_depth_scale2, predict_depth_scale4), axis=1, out=None),
                 global_step=i+train_pics*epoch,
-                dataformats='HW')
-        
+                dataformats='HWC')
+
         print('Epoch:'+str(epoch)+' Pic:'+str(i)+" Processing a single picture using: %.2f s"%(time.time()-time_start))
         print("---------loss             : %.4f" % loss.item())
         print("---------loss_1           : %.4f" % loss_1_smooth.item())
@@ -212,121 +300,123 @@ def train_main_loop(dataloader, feature_ex_net, base_func, feature_ex_net_optimi
 
 def eval_main_loop(eval_dataloader, feature_ex_net, base_func, epoch, writer1):
     it_eval = iter(eval_dataloader)
-    loss_sum = 0.0
+    pbar = tqdm(total=eval_pics)
+
+    rmse_total = 0.0
+    mae_total = 0.0
+    irmse_total = 0.0
+    imae_total = 0.0
+    rel_total = 0.0
+    del_1_total = 0.0
+    del_2_total = 0.0
+    del_3_total = 0.0
     for i in range(eval_pics):
-        sample_dict_eval = next(it_eval)
+        with torch.no_grad():
+            try:
+                sample_dict_eval = next(it_eval)
+            except:
+                continue
 
-        rgb_img = sample_dict_eval['rgb_img']
-        # rgb_img_scale2 = sample_dict_eval['rgb_img_scale2']
-        # rgb_img_scale4 = sample_dict_eval['rgb_img_scale4']
-        disp_gt = sample_dict_eval['disp_gt']
-        point_sample_index = sample_dict_eval['point_sample_index']
-        depth_sample_whole = sample_dict_eval['depth_sample_whole'] # not-sampled points are zero, size as disp_gt
-        index_list = sample_dict_eval['index_list']
+            rgb_img = sample_dict_eval['rgb_img']
+            disp_gt = sample_dict_eval['disp_gt']
+            point_sample_index = sample_dict_eval['point_sample_index']
+            depth_sample_whole = sample_dict_eval['depth_sample_whole'] # not-sampled points are zero, size as disp_gt
+            index_list = sample_dict_eval['index_list']
 
-        rgb_img = rgb_img.to(device, torch.float32)
-        # rgb_img_scale2 = rgb_img_scale2.to(device, torch.float32)
-        # rgb_img_scale4 = rgb_img_scale4.to(device, torch.float32)
-        disp_gt = disp_gt.to(device, torch.float32)
-        depth_sample_whole = depth_sample_whole.to(device, torch.float32)
-        index_list = index_list.squeeze(0).to(device, torch.float32)
-        # depth_sample_whole_copy = depth_sample_whole
+            rgb_img = rgb_img.to(device, torch.float32)
+            disp_gt = disp_gt.to(device, torch.float32)
+            depth_sample_whole = depth_sample_whole.to(device, torch.float32)
+            index_list = index_list.to(device, torch.float32)
+            point_sample_index = point_sample_index.to(device, torch.float32)
 
-        sample_mask = depth_sample_whole > 0
-        depth_sample = torch.masked_select(depth_sample_whole, sample_mask).reshape(sample_num, 1)
+            sample_mask = depth_sample_whole > 0
+            depth_sample = torch.masked_select(depth_sample_whole, sample_mask).reshape(sample_num, 1)
 
-        feature_map = feature_ex_net(rgb_img) # 1*256*resolution*resolution
-        # feature_map_scale2 = feature_ex_net(rgb_img_scale2)
-        # feature_map_scale4 = feature_ex_net(rgb_img_scale4)
+            feature_map = feature_ex_net(rgb_img) # 1*256*resolution*resolution
 
-        feature_map_sample = torch.masked_select(feature_map, sample_mask) # 256000
-        feature_map_sample = feature_map_sample.reshape(1, feature_map_layers, sample_num).permute(0, 2, 1) # 1*1000*256
+            feature_map_sample = torch.masked_select(feature_map, sample_mask) # 256000
+            feature_map_sample = feature_map_sample.reshape(1, feature_map_layers, sample_num).permute(0, 2, 1) # 1*1000*256
 
-        # point_sample_index_norm ： 1*2*sample_num
-        point_sample_index_norm = torch.from_numpy(np.array(point_sample_index, dtype=np.float32).transpose(1, 0))
-        point_sample_index_norm = point_sample_index_norm.to(device, dtype=torch.float32) / \
-                                    torch.tensor([[resolution[0]], [resolution[1]]]).to(device, dtype=torch.float32)
-        point_sample_index_norm = point_sample_index_norm.unsqueeze(0).to(device, dtype=torch.float32)
+            # point_sample_index_norm ： 1*2*sample_num
+            point_sample_index_norm = point_sample_index / torch.tensor([[resolution[0]], [resolution[1]]]).to(device, dtype=torch.float32)
 
-        fc_in = torch.cat((feature_map_sample, position_encoding(point_sample_index_norm)), dim=2) # 1*(256+40)*1000
-        fc_in = fc_in.to(device).squeeze()
+            fc_in = torch.cat((feature_map_sample, position_encoding(point_sample_index_norm)), dim=2) # 1*(256+40)*1000
+            fc_in = fc_in.to(device).squeeze()
 
-        fc_concat = base_func(fc_in) # 1 * sample_num * final_layers
+            fc_concat = base_func(fc_in) # 1 * sample_num * final_layers
 
-        # add pose again
-        fc_concat = torch.cat((fc_concat, position_encoding(point_sample_index_norm).squeeze()), dim=1)
+            # add pose again
+            fc_concat = torch.cat((fc_concat, position_encoding(point_sample_index_norm).squeeze()), dim=1)
+            # caculate w
+            w = least_squres(fc_concat, depth_sample)
+            # predict depth using W
+            feature_map = feature_map.reshape(1, feature_map_layers, resolution[0]*resolution[1]).permute(0, 2, 1)
+            
+            index_list = index_list / torch.tensor([[resolution[0]], [resolution[1]]]).to(device, dtype=torch.float32)
+            fc_pic_in = torch.cat((feature_map, position_encoding(index_list)), axis=2).squeeze()
+            fc_pic_out = base_func(fc_pic_in)
 
-        # caculate w
-        w = least_squres(fc_concat, depth_sample)
+            # add pose again
+            fc_pic_out = torch.cat((fc_pic_out, position_encoding(index_list).squeeze()), dim=1)
+            
+            predict_depth = torch.matmul(fc_pic_out, w).reshape(1, 1, resolution[0], resolution[1])
 
-        predict_sample_depth = torch.matmul(fc_concat, w)
+            loss_dict = evaluation(disp_gt, predict_depth, 0.0001)
 
-        loss_1_smooth = loss_function(predict_sample_depth, depth_sample)
+            rmse = loss_dict['rmse'].item()
+            mae = loss_dict["mae"].item()
+            irmse = loss_dict["irmse"].item()
+            imae = loss_dict["imae"].item()
+            rel = loss_dict["rel"].item()
+            del_1 = loss_dict["del_1"].item()
+            del_2 = loss_dict["del_2"].item()
+            del_3 = loss_dict["del_3"].item()
 
-        # predict depth using W
-        feature_map = feature_map.reshape(1, feature_map_layers, resolution[0]*resolution[1]).permute(0, 2, 1)
-        # feature_map_scale2 = feature_map_scale2.reshape \
-        #                     (1, feature_map_layers, (reso_scale2[0])*(reso_scale2[1])).permute(0, 2, 1)
-        # feature_map_scale4 = feature_map_scale4.reshape \
-        #                     (1, feature_map_layers, (reso_scale4[0])*(reso_scale4[1])).permute(0, 2, 1)
+            rmse_total += rmse
+            mae_total += mae
+            irmse_total += irmse
+            imae_total += imae
+            rel_total += rel
+            del_1_total += del_1
+            del_2_total += del_2
+            del_3_total += del_3
 
-        # index_list = np.array([[i / resolution[0], j / resolution[1]] \
-        #                     for i in range(resolution[0]) for j in range(resolution[1])]).transpose(1, 0)
-        # index_list = torch.from_numpy(index_list).unsqueeze(0).to(device, torch.float32)
+            error_str = 'RMSE= {:.3f} | REL= {:.3f} | D1= {:.3f} | D2= {:.3f} | D3= {:.3f}'.format(
+                        rmse, rel, del_1, del_2, del_3)
+            pbar.set_description(error_str)
+            pbar.update(1)
 
-        # index_list_scale2 = np.array([[i / (reso_scale2[0]), j / (reso_scale2[1])] \
-        #                     for i in range(reso_scale2[0]) for j in range(reso_scale2[1])]).transpose(1, 0)
-        # index_list_scale2 = torch.from_numpy(index_list_scale2).unsqueeze(0).to(device, torch.float32)
-
-        # index_list_scale4 = np.array([[i / (reso_scale4[0]), j / (reso_scale4[1])] \
-        #                     for i in range(reso_scale4[0]) for j in range(reso_scale4[1])]).transpose(1, 0)
-        # index_list_scale4 = torch.from_numpy(index_list_scale4).unsqueeze(0).to(device, torch.float32)
-        
-        fc_pic_in = torch.cat((feature_map, position_encoding(index_list)), axis=2).squeeze()
-        # fc_pic_in_scale2 = torch.cat((feature_map_scale2, \
-        #                         position_encoding(index_list_scale2)), axis=2).squeeze()
-        # fc_pic_in_scale4 = torch.cat((feature_map_scale4, \
-        #                         position_encoding(index_list_scale4)), axis=2).squeeze()
-        fc_pic_out = base_func(fc_pic_in)
-        # fc_pic_out_scale2 = base_func(fc_pic_in_scale2)
-        # fc_pic_out_scale4 = base_func(fc_pic_in_scale4)
-
-        # add pose again
-        fc_pic_out = torch.cat((fc_pic_out, position_encoding(index_list).squeeze()), dim=1)
-        
-        predict_depth = torch.matmul(fc_pic_out, w).reshape(1, 1, resolution[0], resolution[1])
-
-        # multi-scale
-        # predict_depth_scale2 = torch.matmul(fc_pic_out_scale2, w).reshape(1, 1, reso_scale2[0], reso_scale2[1])
-        # predict_depth_scale4 = torch.matmul(fc_pic_out_scale4, w).reshape(1, 1, reso_scale4[0], reso_scale4[1])
-        # final_predict = final_up_net(predict_depth, predict_depth_scale2, predict_depth_scale4)
-
-        loss_2_smooth = loss_function(predict_depth, disp_gt)
-
-        loss = lamda1 * loss_1_smooth + lamda2 * loss_2_smooth
-
-        loss_sum += loss.item()
+    rmse_total /= eval_pics
+    mae_total /= eval_pics
+    irmse_total /= eval_pics
+    imae_total /= eval_pics
+    rel_total /= eval_pics
+    del_1_total /= eval_pics
+    del_2_total /= eval_pics
+    del_3_total /= eval_pics
     print("========================================")
-    print("Evaluation loss is: ", loss_sum)
-    writer1.add_scalar('eval_loss', loss_sum, global_step=epoch)
+    print("RMSE is: ", rmse_total)
+    print("REL is:", rel_total)
+    writer1.add_scalar('RMSE', rmse_total, global_step=epoch)
+    writer1.add_scalar('REL', rel_total, global_step=epoch)
+
+    return rmse_total, rel_total
 
 
 def train_main():
     base_func = fc.FC_basefunction(final_layer, feature_map_layers+20)
-    base_func.load_state_dict(torch.load("./checkpoints/base_bugfixed_baseline.tar"))
+    base_func.load_state_dict(torch.load("./checkpoints/base_gain_with_gradient_loss_rmse_0.16701324204615223_rel_0.04016858216842198_0.tar"))
     base_func = base_func.to(device)
 
     feature_ex_net = fc.DRPNet()
-    feature_ex_net.load_state_dict(torch.load("./checkpoints/unet_bugfixed_baseline.tar"))
+    feature_ex_net.load_state_dict(torch.load("./checkpoints/unet_gain_with_gradient_loss_rmse_0.16701324204615223_rel_0.04016858216842198_0.tar"))
     feature_ex_net = feature_ex_net.to(device)
 
-    # final_up_net = fc.FinalUpsample(resolution, reso_scale2, reso_scale4)
-    # final_up_net.load_state_dict(torch.load("./checkpoints/unet_add_grad_loss_80.tar"))
-    # final_up_net = final_up_net.to(device)
+    # base_func_optimizer = torch.optim.Adam(base_func.parameters(), lr=0.000001, weight_decay=5e-4)
+    # feature_ex_net_optimizer = torch.optim.Adam(feature_ex_net.parameters(), lr=0.00001, weight_decay=5e-4)
 
-    base_func_optimizer = torch.optim.Adam(base_func.parameters(), lr=0.00001, weight_decay=5e-4)
-    feature_ex_net_optimizer = torch.optim.Adam(feature_ex_net.parameters(), lr=0.00001, weight_decay=5e-4)
-    # final_up_net_optimizer = torch.optim.Adam(final_up_net.parameters(), lr=0.00001, weight_decay=5e-4)
+    base_func_optimizer = torch.optim.SGD(base_func.parameters(), lr=0.000001, momentum=0.9)
+    feature_ex_net_optimizer = torch.optim.SGD(feature_ex_net.parameters(), lr=0.00001, momentum=0.9)
 
     writer1 = SummaryWriter(log_dir='runs/' + run_file_name)
 
@@ -337,29 +427,35 @@ def train_main():
     # dataloader = DataLoader(flying_dataset, batch_size=batch_num, shuffle=True, drop_last=True)
     # it = iter(dataloader)
 
-    nyu_dataset = nyu.NYUDataset(filelistpath="./data/NYUv2_train.txt",
-                                 transform=transforms.Compose([nyu.Rescale(resolution, 
-                                                                           size_scale2=reso_scale2,
-                                                                           size_scale4=reso_scale4), 
-                                                               nyu.ToTensor(),
-                                                               nyu.SamplePoint(reso=resolution, 
-                                                                               sample_=sample_num)]))
-    dataloader = DataLoader(nyu_dataset, batch_size=batch_num, shuffle=shuffle_bool, drop_last=True)
+    # nyu_dataset = nyu.NYUDataset(filelistpath="./data/NYUv2_train.txt",
+    #                              transform=transforms.Compose([nyu.Rescale(resolution, 
+    #                                                                        size_scale2=reso_scale2,
+    #                                                                        size_scale4=reso_scale4), 
+    #                                                            nyu.ToTensor(),
+    #                                                            nyu.SamplePoint(reso=resolution, 
+    #                                                                            sample_=sample_num)]))
+    # dataloader = DataLoader(nyu_dataset, batch_size=batch_num, shuffle=shuffle_bool, drop_last=True)
 
 
-    nyu_eval_dataset = nyu.NYUDataset(filelistpath="./data/NYUv2_eval.txt",
+    nyu_eval_dataset = nyu.NYUDatasetAll(filelistpath="./data/nyudepthv2_valid.txt",
                                       transform=transforms.Compose([nyu.Rescale(resolution, 
-                                                                                size_scale2=reso_scale2,
-                                                                                size_scale4=reso_scale4), 
+                                                                                data_gain=False), 
                                                                     nyu.ToTensor(),
                                                                     nyu.SamplePoint(reso=resolution, 
                                                                                     sample_=sample_num)]))
     eval_dataloader = DataLoader(nyu_eval_dataset, batch_size=batch_num, shuffle=shuffle_bool, drop_last=True)
 
+    nyu_dataset = nyu.NYUDatasetAll(filelistpath="./data/nyudepthv2_train.txt",
+                                    transform=transforms.Compose([nyu.Rescale(resolution, 
+                                                                              data_gain=data_gain_bool), 
+                                                                nyu.ToTensor(),
+                                                                nyu.SamplePoint(reso=resolution, 
+                                                                               sample_=sample_num)]))
+    dataloader = DataLoader(nyu_dataset, batch_size=batch_num, shuffle=shuffle_bool, drop_last=True)
+
     for epoch in range(total_epochs):
         base_func.train()
         feature_ex_net.train()
-        # final_up_net.train()
         train_main_loop(dataloader, feature_ex_net, base_func, feature_ex_net_optimizer, \
                         base_func_optimizer, epoch, writer1)
 
@@ -369,17 +465,116 @@ def train_main():
 
             base_func.eval()
             feature_ex_net.eval()
-            # final_up_net.eval()
-            eval_main_loop(eval_dataloader, feature_ex_net, base_func, epoch, writer1)
+            rmse_total, rel_total = eval_main_loop(eval_dataloader, feature_ex_net, base_func, epoch, writer1)
         
-        if (True and (epoch % 10 == 0) and (epoch != 0)):
-            savefilename = './checkpoints/base_'  + run_file_name + "_" + str(epoch)+'.tar'
-            torch.save(base_func.state_dict(), savefilename)
-            savefilename = './checkpoints/unet_' + run_file_name + "_" + str(epoch)+'.tar'
-            torch.save(feature_ex_net.state_dict(), savefilename)
-            # savefilename = './checkpoints/upsample_256_1000_no_multiscale_'+str(epoch)+'.tar'
-            # torch.save(final_up_net.state_dict(), savefilename)
+        # if (True and (epoch % 10 == 0) and (epoch != 0)):
+        savefilename = './checkpoints/base_'  + run_file_name + "_rmse_" \
+                        + str(rmse_total) + "_rel_" + str(rel_total) + "_" + str(epoch)+'.tar'
+        torch.save(base_func.state_dict(), savefilename)
+        savefilename = './checkpoints/unet_'  + run_file_name + "_rmse_" \
+                        + str(rmse_total) + "_rel_" + str(rel_total) + "_" + str(epoch)+'.tar'
+        torch.save(feature_ex_net.state_dict(), savefilename)
+
+
+def train_multiscale():
+    learning_rate = 0.0001
+    net = fc.PyramidDepthEstimation(reso_scale2, reso_scale4, reso_scale8, raw_resolution, sample_num)
+    net = net.to(device)
+    # net.load_state_dict(torch.load("./checkpoints/400points_2.tar"))
+    net_optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate, weight_decay=5e-4)
+
+    nyu_dataset = nyu.NYUDatasetAll(filelistpath="./data/nyudepthv2_train.txt",
+                                    transform=transforms.Compose([nyu.Rescale_Multiscale \
+                                                                 (raw_resolution, reso_scale2, reso_scale4, reso_scale8), 
+                                                            nyu.ToTensor_Multiscale(),
+                                                            nyu.SamplePoint_Multiscale \
+                                                                (reso_scale8, sample_num)]))
+    dataloader = DataLoader(nyu_dataset, batch_size=batch_num, shuffle=shuffle_bool, drop_last=True)
+
+    writer = SummaryWriter(log_dir='runs/' + run_file_name)
+
+    lossfunction = LossFunction()
+
+    for epoch in range(total_epochs):
+        net.train()
+        it = iter(dataloader)
+
+        for i in range(train_pics):
+            time_1 = time.time()
+            try:
+                sample_dict = next(it)
+            except:
+                continue
+            rgb_scale2 = sample_dict['rgb_scale2'].to(device)
+            rgb_scale4 = sample_dict['rgb_scale4'].to(device)
+            rgb_scale8 = sample_dict['rgb_scale8'].to(device)
+            depth_scale8 = sample_dict['depth_scale8'].to(device)
+            depth_scale4 = sample_dict['depth_scale4'].to(device)
+            depth_scale2 = sample_dict['depth_scale2'].to(device)
+            depth_sample_whole = sample_dict['depth_sample_whole'].to(device)
+
+            time_2 = time.time()
+
+            loss1, predict_depth, pre_scale4, pre_scale8 = net(rgb_scale8, rgb_scale4, rgb_scale2, depth_sample_whole)
+
+            time_3 = time.time()
+
+            loss2 = lossfunction(depth_scale2, predict_depth)
+            loss3 = lossfunction(depth_scale4, pre_scale4)
+            loss4 = lossfunction(depth_scale8, pre_scale8)
+
+            loss = loss1 + loss4 + loss3 + loss2
+
+            net.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 10)
+            net_optimizer.step()
+
+            print('Epoch:'+str(epoch)+' Pic:'+str(i)+" Processing a single picture using: %.2f s"%(time.time()-time_1))
+            print("---------loss             : %.4f" % loss.item())
+
+            writer.add_scalar('loss', loss.item(), global_step=i+train_pics*epoch)
+
+            # nyudepthv2 visualization
+            pre_scale4 = upsample_visual(pre_scale4)
+            pre_scale8 = upsample_visual(pre_scale8)
+            depth_sample_whole = upsample_visual(depth_sample_whole)
+            
+            depth_scale2 = depth_scale2 / 10
+            depth_scale2 = depth_scale2.squeeze().detach().cpu().numpy()
+            depth_scale2 = (255.0*cm(depth_scale2)).astype('uint8')
+
+            # depth_scale8 = depth_scale8 / 10
+            # depth_scale8 = depth_scale8.squeeze().detach().cpu().numpy()
+            # depth_scale8 = (255.0*cm(depth_scale8)).astype('uint8')
+
+            pre_scale8 = pre_scale8 / 10
+            pre_scale8 = pre_scale8.squeeze().detach().cpu().numpy()
+            pre_scale8 = (255.0*cm(pre_scale8)).astype('uint8')
+
+            pre_scale4 = pre_scale4 / 10
+            pre_scale4 = pre_scale4.squeeze().detach().cpu().numpy()
+            pre_scale4 = (255.0*cm(pre_scale4)).astype('uint8')
+
+            predict_depth = predict_depth / 10
+            predict_depth = predict_depth.squeeze().detach().cpu().numpy()
+            predict_depth = (255.0*cm(predict_depth)).astype('uint8')
+
+            depth_sample_whole = depth_sample_whole / 10
+            depth_sample_whole = depth_sample_whole.squeeze().detach().cpu().numpy()
+            depth_sample_whole = (255.0*cm(depth_sample_whole)).astype('uint8')
+
+            if (i % 30 == 0):
+                writer.add_image('groundtruth and out', 
+                    np.concatenate((depth_scale2, depth_sample_whole, predict_depth, pre_scale4, pre_scale8), axis=1),
+                    # np.concatenate((depth_scale8, pre_scale8, depth_sample_whole), axis=1),
+                    global_step=i+train_pics*epoch,
+                    dataformats='HWC')
+
+        savefilename = './checkpoints/' + run_file_name + "_" + str(epoch)+'.tar'
+        torch.save(net.state_dict(), savefilename)
 
 
 if __name__ == '__main__':
-    train_main()
+    # train_main()
+    train_multiscale()
