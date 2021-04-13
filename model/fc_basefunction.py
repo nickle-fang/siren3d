@@ -212,8 +212,25 @@ class PyramidDepthEstimation(nn.Module):
             nn.BatchNorm2d(128),
             nn.Tanh()
         )
-        self.init_upsample1 = nn.ConvTranspose2d(in_channels=128, out_channels=64, kernel_size=2, stride=2)
         self.init_unet4 = nn.Sequential(
+            nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.Tanh(),
+            nn.Conv2d(in_channels=256, out_channels=256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.Tanh()
+        )
+        self.init_upsample1 = nn.ConvTranspose2d(in_channels=256, out_channels=128, kernel_size=2, stride=2)
+        self.init_unet5 = nn.Sequential(
+            nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.Tanh(),
+            nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.Tanh()
+        )
+        self.init_upsample2 = nn.ConvTranspose2d(in_channels=128, out_channels=64, kernel_size=2, stride=2)
+        self.init_unet6 = nn.Sequential(
             nn.Conv2d(in_channels=128, out_channels=64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.Tanh(),
@@ -221,8 +238,8 @@ class PyramidDepthEstimation(nn.Module):
             nn.BatchNorm2d(64),
             nn.Tanh()
         )
-        self.init_upsample2 = nn.ConvTranspose2d(in_channels=64, out_channels=32, kernel_size=2, stride=2)
-        self.init_unet5 = nn.Sequential(
+        self.init_upsample3 = nn.ConvTranspose2d(in_channels=64, out_channels=32, kernel_size=2, stride=2)
+        self.init_unet7 = nn.Sequential(
             nn.Conv2d(in_channels=64, out_channels=32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.Tanh(),
@@ -230,6 +247,7 @@ class PyramidDepthEstimation(nn.Module):
             nn.BatchNorm2d(32),
             nn.Tanh()
         )
+
         self.add_channel = nn.Sequential(
             nn.Conv2d(in_channels=32, out_channels=64, kernel_size=1),
             nn.BatchNorm2d(64),
@@ -308,18 +326,21 @@ class PyramidDepthEstimation(nn.Module):
             nn.Conv2d(in_channels=32, out_channels=16, kernel_size=1),
             nn.BatchNorm2d(16),
             nn.LeakyReLU(),
+            nn.Conv2d(in_channels=16, out_channels=16, kernel_size=1),
+            nn.BatchNorm2d(16),
+            nn.LeakyReLU(),
             nn.Conv2d(in_channels=16, out_channels=1, kernel_size=1),
             nn.BatchNorm2d(1),
             nn.LeakyReLU()
         )
-        self.finetune_output = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, padding=1),
-            nn.BatchNorm2d(1),
-            nn.LeakyReLU(),
-            nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, padding=1),
-            nn.BatchNorm2d(1),
-            nn.LeakyReLU()
-        )
+        # self.finetune_output = nn.Sequential(
+        #     nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, padding=1),
+        #     nn.BatchNorm2d(1),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, padding=1),
+        #     nn.BatchNorm2d(1),
+        #     nn.LeakyReLU()
+        # )
         #################################
 
         #################################
@@ -331,83 +352,18 @@ class PyramidDepthEstimation(nn.Module):
         self.finetune_res6 = BasicBlock(48, 24)
         self.finetune_res7 = BasicBlock(24, 12)
         self.finetune_res8 = BasicBlock(12, 1)
-        # self.finetune_unet1_2 = nn.Sequential(
-        #     nn.Conv2d(in_channels=4, out_channels=32, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(32),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(32),
-        #     nn.LeakyReLU()
-        # )
-        # self.finetune_unet2_2 = nn.Sequential(
-        #     nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(64),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(64),
-        #     nn.LeakyReLU()
-        # )
-        # self.finetune_unet3_2 = nn.Sequential(
-        #     nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(128),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(128),
-        #     nn.LeakyReLU()
-        # )
-        # self.finetune_unet4_2 = nn.Sequential(
-        #     nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(256),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(in_channels=256, out_channels=256, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(256),
-        #     nn.LeakyReLU()
-        # )
-        # self.finetune_upsample1_2 = nn.ConvTranspose2d(in_channels=256, out_channels=128, kernel_size=2, stride=2)
-        # self.finetune_unet5_2 = nn.Sequential(
-        #     nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(128),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(128),
-        #     nn.LeakyReLU()
-        # )
-        # self.finetune_upsample2_2 = nn.ConvTranspose2d(in_channels=128, out_channels=64, kernel_size=2, stride=2)
-        # self.finetune_unet6_2 = nn.Sequential(
-        #     nn.Conv2d(in_channels=128, out_channels=64, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(64),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(64),
-        #     nn.LeakyReLU()
-        # )
-        # self.finetune_upsample3_2 = nn.ConvTranspose2d(in_channels=64, out_channels=32, kernel_size=2, stride=2)
-        # self.finetune_unet7_2 = nn.Sequential(
-        #     nn.Conv2d(in_channels=64, out_channels=32, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(32),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(32),
-        #     nn.LeakyReLU()
-        # )
 
-        # self.finetune_compress_2 = nn.Sequential(
-        #     nn.Conv2d(in_channels=32, out_channels=16, kernel_size=1),
-        #     nn.BatchNorm2d(16),
+        # self.resnet_output = nn.Sequential(
+        #     nn.Conv2d(in_channels=1, out_channels=3, kernel_size=3, padding=1),
+        #     nn.BatchNorm2d(3),
         #     nn.LeakyReLU(),
-        #     nn.Conv2d(in_channels=16, out_channels=1, kernel_size=1),
+        #     nn.Conv2d(in_channels=3, out_channels=3, kernel_size=3, padding=1),
+        #     nn.BatchNorm2d(3),
+        #     nn.LeakyReLU(),
+        #     nn.Conv2d(in_channels=3, out_channels=1, kernel_size=3, padding=1),
         #     nn.BatchNorm2d(1),
         #     nn.LeakyReLU()
         # )
-        # self.finetune_output_2 = nn.Sequential(
-        #     nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(1),
-        #     nn.LeakyReLU(),
-        #     nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, padding=1),
-        #     nn.BatchNorm2d(1),
-        #     nn.LeakyReLU()
-        # )
-        #################################
 
         self.fc_net1 = nn.Sequential(
             nn.Linear(in_features=276, out_features=512),
@@ -456,10 +412,15 @@ class PyramidDepthEstimation(nn.Module):
         out3 = self.maxpool(out2)
         out3 = self.init_unet3(out3)
 
-        up_1 = self.init_upsample1(out3)
-        up_2 = self.init_unet4(torch.cat((up_1, out2), dim=1))
-        up_3 = self.init_upsample2(up_2)
-        out = self.init_unet5(torch.cat((up_3, out1), dim=1))
+        out4 = self.maxpool(out3)
+        out4 = self.init_unet4(out4)
+
+        up_1 = self.init_upsample1(out4)
+        temp_1 = self.init_unet5(torch.cat((up_1, out3), dim=1))
+        up_2 = self.init_upsample2(temp_1)
+        temp_2 = self.init_unet6(torch.cat((up_2, out2), dim=1))
+        up_3 = self.init_upsample3(temp_2)
+        out = self.init_unet7(torch.cat((up_3, out1), dim=1))
 
         out = self.add_channel(out)
 
@@ -548,7 +509,7 @@ class PyramidDepthEstimation(nn.Module):
 
         out = self.finetune_compress(up_3)
         out = out + depth
-        out = self.finetune_output(out)
+        # out = self.finetune_output(out)
 
         return out
 
@@ -563,29 +524,32 @@ class PyramidDepthEstimation(nn.Module):
         out = self.finetune_res7(out)
         out = self.finetune_res8(out)
 
+        out = out + depth
+        # out = self.resnet_output(out)
+
         return out
 
 
-    def forward(self, scale8pic, scale4pic, scale2pic, depth_sample_whole):
-        reso1_feature_map = self.unet_init_process(scale8pic)
+    def forward(self, scale4pic, scale2pic, depth_sample_whole):
+        reso1_feature_map = self.unet_init_process(scale4pic)
         w, loss1 = self.get_w(reso1_feature_map, depth_sample_whole)
+        
         size_h = reso1_feature_map.size()[2]
         size_w = reso1_feature_map.size()[3]
         reso1_index = self.get_pose_channel(size_h, size_w)
-        
-        reso1_feature_map = torch.cat((reso1_feature_map, reso1_index), dim=1)
-        feature_map_layers = reso1_feature_map.size()[1]
 
+        reso1_feature_map = torch.cat((reso1_feature_map, reso1_index), dim=1)
+
+        feature_map_layers = reso1_feature_map.size()[1]
         feature_map_reshape = reso1_feature_map.reshape(feature_map_layers, size_h*size_w).permute(1, 0)
         fc_out = self.fc_process(feature_map_reshape)
         predict_init_depth = torch.matmul(fc_out, w).reshape(1, 1, size_h, size_w)
 
         # finetune
-        depth_upsample1 = nn.functional.interpolate(predict_init_depth, self.reso_scale4, mode='bilinear', align_corners=True)
-        predict_depth_2 = self.finetune_process_2(scale4pic, depth_upsample1)
+        depth_finetune_1 = self.finetune_process(scale4pic, predict_init_depth)
+        depth_upsample1 = nn.functional.interpolate(depth_finetune_1, self.reso_scale2, mode='bilinear', align_corners=True)
+        depth_finetune_2 = self.finetune_process_2(scale2pic, depth_upsample1)
 
-        depth_upsample2 = nn.functional.interpolate(predict_depth_2, self.reso_scale2, mode='bilinear', align_corners=True)
-        predict_depth = self.finetune_process_2(scale2pic, depth_upsample2)
 
-        return loss1, predict_depth, predict_depth_2, predict_init_depth
+        return loss1, depth_finetune_1, depth_finetune_2, predict_init_depth
 

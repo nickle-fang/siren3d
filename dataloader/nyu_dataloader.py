@@ -1,9 +1,9 @@
 #!/home/nickle/miniconda3/envs/siren3d/bin/python
 
-from __future__ import print_function, division
 import torch
 import random
 import os
+import cv2
 import h5py
 import numpy as np
 from torch.utils.data import Dataset
@@ -12,24 +12,23 @@ from PIL import Image
 import torchvision.transforms.functional as TF
 
 
-local_pos = "/home/nickle/Desktop/siren3d/temp_files"
-# local_pos = "/media/nickle/WD_BLUE"
+local_pos = "/media/nickle/WD_BLUE"
 server_pos = "../SSD"
 use_pos = server_pos
 if (use_pos == server_pos):
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class Rescale(object):
-    def __init__(self, output_size, data_gain):
+    def __init__(self, output_size, data_gain=False):
         assert isinstance(output_size, tuple)
         self.output_size = output_size
         self.data_gain = data_gain
 
     def __call__(self, sample):
-        rgb_img_raw, disp_gt = sample['rgb_img'], sample['disp_gt']
+        rgb_img_raw, disp_gt_raw = sample['rgb_img'], sample['disp_gt']
 
         if (self.data_gain):
             degree = np.random.uniform(-5.0, 5.0)
@@ -38,20 +37,21 @@ class Rescale(object):
             
             if (flip > 0.5):
                 rgb_img_raw = TF.hflip(rgb_img_raw)
-                disp_gt = TF.hflip(disp_gt)
+                disp_gt_raw = TF.hflip(disp_gt_raw)
             rgb_img_raw = TF.rotate(rgb_img_raw, angle=degree, resample=Image.NEAREST)
-            disp_gt = TF.rotate(disp_gt, angle=degree, resample=Image.NEAREST)
+            disp_gt_raw = TF.rotate(disp_gt_raw, angle=degree, resample=Image.NEAREST)
         
             rgb_img = transforms.CenterCrop(self.output_size)(rgb_img_raw)
-            disp_gt = transforms.CenterCrop(self.output_size)(disp_gt)
+            disp_gt = transforms.CenterCrop(self.output_size)(disp_gt_raw)
 
         else:
             rgb_img = transforms.Resize(self.output_size)(rgb_img_raw)
-            disp_gt = transforms.Resize(self.output_size)(disp_gt)
+            disp_gt = transforms.Resize(self.output_size)(disp_gt_raw)
 
 
         return {'rgb_img': rgb_img, 
-                'disp_gt': disp_gt}
+                'disp_gt': disp_gt,
+                'disp_gt_raw': disp_gt_raw}
 
 
 class Rescale_Multiscale(object):
@@ -63,7 +63,7 @@ class Rescale_Multiscale(object):
         self.data_gain = data_gain
 
     def __call__(self, sample):
-        rgb_img_raw, disp_gt = sample['rgb_img'], sample['disp_gt']
+        rgb_img_raw, disp_gt_raw = sample['rgb_img'], sample['disp_gt']
 
         if (self.data_gain):
             degree = np.random.uniform(-5.0, 5.0)
@@ -72,7 +72,7 @@ class Rescale_Multiscale(object):
             
             if (flip > 0.5):
                 rgb_img_raw = TF.hflip(rgb_img_raw)
-                disp_gt = TF.hflip(disp_gt)
+                disp_gt = TF.hflip(disp_gt_raw)
             rgb_img_raw = TF.rotate(rgb_img_raw, angle=degree, resample=Image.NEAREST)
             disp_gt = TF.rotate(disp_gt, angle=degree, resample=Image.NEAREST)
         
@@ -82,42 +82,46 @@ class Rescale_Multiscale(object):
         else:
             rgb_scale2 = transforms.Resize(self.size_scale2)(rgb_img_raw)
             rgb_scale4 = transforms.Resize(self.size_scale4)(rgb_img_raw)
-            rgb_scale8 = transforms.Resize(self.size_scale8)(rgb_img_raw)
-            depth_scale2 = transforms.Resize(self.size_scale2)(disp_gt)
-            depth_scale4 = transforms.Resize(self.size_scale4)(disp_gt)
-            depth_scale8 = transforms.Resize(self.size_scale8)(disp_gt)
+            # rgb_scale8 = transforms.Resize(self.size_scale8)(rgb_img_raw)
+            depth_scale2 = transforms.Resize(self.size_scale2)(disp_gt_raw)
+            depth_scale4 = transforms.Resize(self.size_scale4)(disp_gt_raw)
+            # depth_scale8 = transforms.Resize(self.size_scale8)(disp_gt)
 
         return {'rgb_scale2': rgb_scale2, 
                 'rgb_scale4': rgb_scale4, 
-                'rgb_scale8': rgb_scale8, 
+                # 'rgb_scale8': rgb_scale8, 
                 'depth_scale2': depth_scale2,
                 'depth_scale4': depth_scale4,
-                'depth_scale8': depth_scale8}
+                'disp_gt_raw': disp_gt_raw}
+                # 'depth_scale8': depth_scale8}
 
 
 class ToTensor(object):
     def __call__(self, sample):
-        rgb_img, disp_gt = sample['rgb_img'], sample['disp_gt']
+        rgb_img, disp_gt, disp_gt_raw = sample['rgb_img'], sample['disp_gt'], sample['disp_gt_raw']
 
         return {'rgb_img': transforms.ToTensor()(rgb_img),
-                'disp_gt': transforms.ToTensor()(disp_gt)}
+                'disp_gt': transforms.ToTensor()(disp_gt),
+                'disp_gt_raw': transforms.ToTensor()(disp_gt_raw)}
 
 
 class ToTensor_Multiscale(object):
     def __call__(self, sample):
         rgb_scale2 = sample['rgb_scale2']
         rgb_scale4 = sample['rgb_scale4']
-        rgb_scale8 = sample['rgb_scale8']
+        # rgb_scale8 = sample['rgb_scale8']
         depth_scale2 = sample['depth_scale2']
         depth_scale4 = sample['depth_scale4']
-        depth_scale8 = sample['depth_scale8']
+        disp_gt_raw = sample['disp_gt_raw']
+        # depth_scale8 = sample['depth_scale8']
         
         return {'rgb_scale2': transforms.ToTensor()(rgb_scale2), 
                 'rgb_scale4': transforms.ToTensor()(rgb_scale4), 
-                'rgb_scale8': transforms.ToTensor()(rgb_scale8), 
+                # 'rgb_scale8': transforms.ToTensor()(rgb_scale8), 
                 'depth_scale2': transforms.ToTensor()(depth_scale2),
                 'depth_scale4': transforms.ToTensor()(depth_scale4),
-                'depth_scale8': transforms.ToTensor()(depth_scale8)}
+                'disp_gt_raw': transforms.ToTensor()(disp_gt_raw)}
+                # 'depth_scale8': transforms.ToTensor()(depth_scale8)}
 
 
 class SamplePoint(object):
@@ -129,7 +133,7 @@ class SamplePoint(object):
         self.index_list = torch.from_numpy(self.index_list)
 
     def __call__(self, sample):
-        rgb_img, disp_gt = sample['rgb_img'], sample['disp_gt']
+        rgb_img, disp_gt, disp_gt_raw = sample['rgb_img'], sample['disp_gt'], sample['disp_gt_raw']
         rgb_img = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))(rgb_img)
 
         disp_mask = disp_gt > 0
@@ -143,42 +147,44 @@ class SamplePoint(object):
         depth_sample_whole = torch.zeros_like(disp_gt)
         depth_sample_whole -= 1
         index_i = 0
-        point_sample_index = torch.zeros(2, self.sample_)
+        # point_sample_index = torch.zeros(2, self.sample_)
         for p in random_choice:
             depth_sample_whole[:, index_list_masked[0, p].long(), index_list_masked[1, p].long()] = \
                 disp_gt[:, index_list_masked[0, p].long(), index_list_masked[1, p].long()]
-            point_sample_index[0, index_i] = index_list_masked[0, p]
-            point_sample_index[1, index_i] = index_list_masked[1, p]
+            # point_sample_index[0, index_i] = index_list_masked[0, p]
+            # point_sample_index[1, index_i] = index_list_masked[1, p]
             index_i += 1
 
-        return {'rgb_img':rgb_img, 
-                'disp_gt':disp_gt, 
-                'point_sample_index':point_sample_index, 
-                'depth_sample_whole':depth_sample_whole, 
-                'index_list': self.index_list}
+        return {'rgb_scale2':rgb_img, 
+                'depth_scale2':disp_gt, 
+                # 'index_list': self.index_list,
+                # 'point_sample_index':point_sample_index, 
+                'depth_sample_whole':depth_sample_whole,
+                'disp_gt_raw': disp_gt_raw}
 
 
 class SamplePoint_Multiscale(object):
-    def __init__(self, reso_scale8, sample_):
-        self.resolution = reso_scale8
+    def __init__(self, reso_scale4, sample_):
+        self.resolution = reso_scale4
         self.sample_ = sample_
 
-        self.index_list = np.array([[i, j] for i in range(reso_scale8[0]) for j in range(reso_scale8[1])]).transpose(1, 0)
+        self.index_list = np.array([[i, j] for i in range(reso_scale4[0]) for j in range(reso_scale4[1])]).transpose(1, 0)
         self.index_list = torch.from_numpy(self.index_list)
 
     def __call__(self, sample):
         rgb_scale2 = sample['rgb_scale2']
         rgb_scale4 = sample['rgb_scale4']
-        rgb_scale8 = sample['rgb_scale8']
-        depth_scale8 = sample['depth_scale8']
+        # rgb_scale8 = sample['rgb_scale8']
+        # depth_scale8 = sample['depth_scale8']
         depth_scale4 = sample['depth_scale4']
         depth_scale2 = sample['depth_scale2']
+        disp_gt_raw = sample['disp_gt_raw']
 
         rgb_scale2 = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))(rgb_scale2)
         rgb_scale4 = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))(rgb_scale4)
-        rgb_scale8 = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))(rgb_scale8)
+        # rgb_scale8 = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))(rgb_scale8)
 
-        disp_mask = depth_scale8 > 0
+        disp_mask = depth_scale4 > 0
 
         index_list_masked = torch.masked_select(self.index_list.reshape\
                                                 (2, self.resolution[0], self.resolution[1]), disp_mask)
@@ -186,20 +192,21 @@ class SamplePoint_Multiscale(object):
         index_list_masked = index_list_masked.reshape(2, masked_points_num)
         random_choice = random.sample(range(masked_points_num), self.sample_)
         random_choice = sorted(random_choice)
-        depth_sample_whole = torch.zeros_like(depth_scale8)
+        depth_sample_whole = torch.zeros_like(depth_scale4)
         depth_sample_whole -= 1
         index_i = 0
         for p in random_choice:
             depth_sample_whole[:, index_list_masked[0, p].long(), index_list_masked[1, p].long()] = \
-                depth_scale8[:, index_list_masked[0, p].long(), index_list_masked[1, p].long()]
+                depth_scale4[:, index_list_masked[0, p].long(), index_list_masked[1, p].long()]
             index_i += 1
 
         return {'rgb_scale2': rgb_scale2, 
                 'rgb_scale4': rgb_scale4, 
-                'rgb_scale8': rgb_scale8, 
-                'depth_scale8': depth_scale8,
+                # 'rgb_scale8': rgb_scale8, 
+                # 'depth_scale8': depth_scale8,
                 'depth_scale4': depth_scale4,
                 'depth_scale2': depth_scale2,
+                'disp_gt_raw': disp_gt_raw,
                 'depth_sample_whole':depth_sample_whole}
 
 
@@ -254,7 +261,7 @@ class NYUDatasetAll(Dataset):
         return sample
 
 
-# if __name__ == "__main__":
+if __name__ == "__main__":
 #     rootdir = "/home/nickle/Desktop/siren3d/temp_files/nyudepthv2"
 #     first_dir_list = os.listdir(rootdir)  # 列出文件夹下所有的目录与文件
 #     val_dir = rootdir + '/' + first_dir_list[0] + '/official'
@@ -278,12 +285,28 @@ class NYUDatasetAll(Dataset):
     #     print(dir)
     # print(files)
 
+        # return {'rgb_scale2': rgb_scale2, 
+        #         'rgb_scale4': rgb_scale4, 
+        #         'rgb_scale8': rgb_scale8, 
+        #         'depth_scale8': depth_scale8,
+        #         'depth_scale4': depth_scale4,
+        #         'depth_scale2': depth_scale2,
+        #         'depth_sample_whole':depth_sample_whole}
 
-#     nyu_dataset = NYUDataset(transform=transforms.Compose([Rescale((224,224)), ToTensor()]))
+    nyu_dataset = NYUDatasetAll(filelistpath="../data/nyudepthv2_valid.txt",
+                                    transform=transforms.Compose([Rescale_Multiscale \
+                                                                 ((480,640), (240,320), (120,160), (60,80)), 
+                                                            ToTensor_Multiscale(),
+                                                            SamplePoint_Multiscale \
+                                                                ((60,80), 200)]))
 
-#     for i in range(2):
-#         sample = nyu_dataset[i]
-#         rgb_img = sample['rgb_img']base_bugfixed_baseline.tar
-#         disp_gt = sample['disp_gt']
+    for i in range(2):
+        sample = nyu_dataset[i]
+        rgb_img = sample['rgb_scale2']
 
-#         print(disp_gt)
+        rgb_img = rgb_img.cpu().numpy().transpose(1,2,0)
+        cv2.imshow("test", rgb_img)
+        cv2.waitKey()
+        cv2.destroyAllWindows()
+        print(rgb_img.shape)
+

@@ -22,7 +22,7 @@ final_layer = 256 # also in other files
 feature_map_layers = 256
 resolution = (480, 640)
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
