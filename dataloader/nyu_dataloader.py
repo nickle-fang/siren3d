@@ -6,6 +6,7 @@ import os
 import cv2
 import h5py
 import numpy as np
+import scipy.ndimage
 from torch.utils.data import Dataset
 from torchvision import transforms
 from PIL import Image
@@ -14,7 +15,7 @@ import torchvision.transforms.functional as TF
 
 local_pos = "/media/nickle/WD_BLUE"
 server_pos = "../SSD"
-use_pos = server_pos
+use_pos = local_pos
 if (use_pos == server_pos):
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = "2"
@@ -96,6 +97,24 @@ class Rescale_Multiscale(object):
                 # 'depth_scale8': depth_scale8}
 
 
+class Rescale_update(object):
+    def __init__(self, resolution, reso_scale2):
+        self.resolution = resolution
+        self.reso_scale2 = reso_scale2
+
+    def __call__(self, sample):
+        rgb_img_raw, disp_gt_raw = sample['rgb_img'], sample['disp_gt']
+
+        rgb_resize = transforms.Resize(self.resolution)(rgb_img_raw)
+        rgb_scale2 = transforms.Resize(self.reso_scale2)(rgb_img_raw)
+        depth_resize = transforms.Resize(self.resolution)(disp_gt_raw)
+
+        return {'rgb_resize': rgb_resize,
+                'depth_resize': depth_resize,
+                'rgb_img_raw': rgb_img_raw,
+                'disp_gt_raw': disp_gt_raw,
+                'rgb_scale2': rgb_scale2}
+
 class ToTensor(object):
     def __call__(self, sample):
         rgb_img, disp_gt, disp_gt_raw = sample['rgb_img'], sample['disp_gt'], sample['disp_gt_raw']
@@ -122,6 +141,21 @@ class ToTensor_Multiscale(object):
                 'depth_scale4': transforms.ToTensor()(depth_scale4),
                 'disp_gt_raw': transforms.ToTensor()(disp_gt_raw)}
                 # 'depth_scale8': transforms.ToTensor()(depth_scale8)}
+
+
+class ToTensor_update(object):
+    def __call__(self, sample):
+        rgb_resize = sample['rgb_resize']
+        depth_resize= sample['depth_resize']
+        rgb_img_raw = sample['rgb_img_raw']
+        disp_gt_raw = sample['disp_gt_raw']
+        rgb_scale2 = sample['rgb_scale2']
+
+        return {'rgb_resize': transforms.ToTensor()(rgb_resize),
+                'depth_resize': transforms.ToTensor()(depth_resize),
+                'rgb_img_raw': transforms.ToTensor()(rgb_img_raw),
+                'disp_gt_raw': transforms.ToTensor()(disp_gt_raw),
+                'rgb_scale2': transforms.ToTensor()(rgb_scale2)}
 
 
 class SamplePoint(object):
@@ -208,6 +242,58 @@ class SamplePoint_Multiscale(object):
                 'depth_scale2': depth_scale2,
                 'disp_gt_raw': disp_gt_raw,
                 'depth_sample_whole':depth_sample_whole}
+
+
+class SamplePoint_update(object):
+    def __init__(self, resolution, sample):
+        self.resolution = resolution
+        self.sample_ = sample
+
+        self.index_list = np.array([[i, j] for i in range(resolution[0]) for j in range(resolution[1])]).transpose(1, 0)
+        self.index_list = torch.from_numpy(self.index_list)
+
+    def __call__(self, sample):
+        rgb_resize = sample['rgb_resize']
+        depth_resize= sample['depth_resize']
+        rgb_img_raw = sample['rgb_img_raw']
+        disp_gt_raw = sample['disp_gt_raw']
+        rgb_scale2 = sample['rgb_scale2']
+
+        rgb_resize = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))(rgb_resize)
+        rgb_img_raw = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))(rgb_img_raw)
+
+        disp_mask = depth_resize > 0
+
+        index_list_masked = torch.masked_select(self.index_list.reshape\
+                                                (2, self.resolution[0], self.resolution[1]), disp_mask)
+        masked_points_num = int(index_list_masked.size()[0] / 2) # useful points number
+        index_list_masked = index_list_masked.reshape(2, masked_points_num)
+        random_choice = random.sample(range(masked_points_num), self.sample_)
+        random_choice = sorted(random_choice)
+        depth_sample_whole = torch.zeros_like(depth_resize)
+        depth_sample_whole -= 1
+        for p in random_choice:
+            depth_sample_whole[:, index_list_masked[0, p].long(), index_list_masked[1, p].long()] = \
+                depth_resize[:, index_list_masked[0, p].long(), index_list_masked[1, p].long()]
+
+        gradx = scipy.ndimage.sobel(depth_resize.numpy(), axis=1).squeeze(0)[..., None]
+        grady = scipy.ndimage.sobel(depth_resize.numpy(), axis=2).squeeze(0)[..., None]
+        laplace = scipy.ndimage.laplace(depth_resize.numpy()).squeeze(0)[..., None]
+
+        gt_gradient = torch.cat((torch.from_numpy(gradx).reshape(-1, 1),
+                                 torch.from_numpy(grady).reshape(-1, 1)),
+                                 dim=-1)
+        laplace = torch.from_numpy(laplace).view(-1, 1)
+
+        return {'rgb_resize': rgb_resize,
+                'depth_resize': depth_resize,
+                'rgb_img_raw': rgb_img_raw,
+                'disp_gt_raw': disp_gt_raw,
+                'depth_sample_whole': depth_sample_whole,
+                'gt_gradient': gt_gradient,
+                'index_list': self.index_list,
+                'gt_laplace': laplace,
+                'rgb_scale2': rgb_scale2}
 
 
 class NYUDataset(Dataset):

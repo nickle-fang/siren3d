@@ -5,6 +5,7 @@ import time
 import os
 import cv2
 import math
+import cmapy
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
@@ -13,6 +14,7 @@ from torchvision import transforms
 import torch.nn.functional as F
 from tensorboardX import SummaryWriter
 from torchvision.transforms.transforms import RandomCrop
+import matplotlib.colors as colors
 
 from dataloader import flying3d_dataloader as fly
 from dataloader import nyu_dataloader as nyu
@@ -25,7 +27,7 @@ eval_bool = True
 train_pics = 47584
 eval_pics = 654
 total_epochs = 20000
-sample_num = 200
+sample_num = 250
 final_layer = 256 # also in other files
 feature_map_layers = 256
 resolution = (120, 160)
@@ -35,11 +37,12 @@ reso_scale4 = (120, 160)
 reso_scale8 = (64, 80)
 lamda1 = 1 # loss_1
 lamda2 = 1 # loss_2
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-run_file_name = "multiscale_160"
+run_file_name = "grad_finetune"
+use_dxdy = True
 data_gain_bool = True
 
 # define loss function
@@ -52,9 +55,11 @@ class LossFunction(torch.nn.Module):
         super(LossFunction, self).__init__()
         self.loss_function = torch.nn.L1Loss()
     
-    def forward(self, gt, predict):
-        mask = gt > 0
-        loss = self.loss_function(gt[mask], predict[mask])
+    def forward(self, gt, predict, mask=None):
+        if (mask==None):
+            loss = self.loss_function(gt, predict)    
+        else:
+            loss = self.loss_function(gt[mask], predict[mask])
 
         return loss
 
@@ -98,7 +103,7 @@ class Sobel(torch.nn.Module):
     def forward(self, x):
         out = self.edge_conv(x) 
         out = out.contiguous().view(-1, 2, x.size(2), x.size(3))
-  
+
         return out
 
 get_gradient = Sobel().to(device)
@@ -518,11 +523,12 @@ def train_main():
 
 
 def train_multiscale():
-    learning_rate = 3e-3
+    learning_rate = 1e-5
     net = fc.PyramidDepthEstimation(reso_scale2, reso_scale4, reso_scale8, raw_resolution, sample_num)
     net = net.to(device)
-    # net.load_state_dict(torch.load("./checkpoints/finetune_resnet_gradloss_4.tar"))
-    net_optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate, weight_decay=5e-4)
+    net.load_state_dict(torch.load("./checkpoints/unet_baseline.tar"))
+    # net_optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate, weight_decay=5e-4)
+    net_optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate, momentum=0.9)
 
     nyu_dataset = nyu.NYUDatasetAll(filelistpath="./data/nyudepthv2_train.txt",
                                     transform=transforms.Compose([nyu.Rescale_Multiscale \
@@ -548,13 +554,13 @@ def train_multiscale():
         net.train()
         it = iter(dataloader)
 
-        if (epoch > 3):
-            learning_rate = 4e-4
-        if (epoch > 5):
-            learning_rate = 4e-5
-        if (epoch > 8):
-            learning_rate = 4e-6
-        net_optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate, weight_decay=5e-4)
+        # if (epoch > 3):
+        #     learning_rate = 1e-5
+        # if (epoch > 5):
+        #     learning_rate = 1e-6
+        # if (epoch > 8):
+        #     learning_rate = 1e-7
+        # net_optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate, weight_decay=5e-4)
 
         for i in range(train_pics):
             time_1 = time.time()
@@ -578,7 +584,8 @@ def train_multiscale():
             time_2 = time.time()
 
             # loss1, predict_depth, pre_scale4, pre_scale8 = net(rgb_scale8, rgb_scale4, rgb_scale2, depth_sample_whole)
-            loss1, depth_finetune_1, depth_finetune_2, predict_init_depth = net(rgb_scale4, rgb_scale2, depth_sample_whole)
+            loss1, delta_h_loss, delta_w_loss, depth_finetune_1, depth_finetune_2, predict_init_depth = \
+                net(rgb_scale4, rgb_scale2, depth_sample_whole, use_dxdy=use_dxdy)
 
             predict_depth_kid = upsample_visual(depth_finetune_1)
             predict_depth_final = upsample_visual(depth_finetune_2)
@@ -590,17 +597,17 @@ def train_multiscale():
             loss3 = lossfunction(disp_gt_raw, predict_depth_kid)
             loss4 = lossfunction(disp_gt_raw, predict_depth_final)
 
+            grad_loss = gradloss(disp_gt_raw, predict_init_depth) + gradloss(disp_gt_raw, predict_depth_kid) \
+                        + gradloss(disp_gt_raw, predict_depth_final)
+
             # loss3 = lossfunction(depth_scale4, pre_scale4)
             # loss4 = lossfunction(depth_scale8, pre_scale8)
 
-            # gradloss2 = gradloss(depth_scale2, predict_init_depth)
-            # gradloss2_final = gradloss(depth_scale2, predict_depth)
-
-            # gradloss3 = gradloss(depth_scale4, pre_scale4)
-            # gradloss4 = gradloss(depth_scale8, pre_scale8)
-
             # loss = loss1 + loss4 + loss3 + loss2 + gradloss2 + gradloss3 + gradloss4
-            loss = loss1 + loss2 #+ loss3 + gradloss2 + gradloss2_final # + loss3
+            if (delta_h_loss != None):
+                loss = loss1 + 2*loss2 + loss3 + loss4 + grad_loss + delta_h_loss + delta_w_loss
+            else:
+                loss = loss1 + 2*loss2 + loss3 + loss4 + grad_loss
 
             net.zero_grad()
             loss.backward()
@@ -608,7 +615,7 @@ def train_multiscale():
             net_optimizer.step()
 
             print(run_file_name + ' Epoch:'+str(epoch)+' Pic:'+str(i)+" Using: %.2f s"%(time.time()-time_1))
-            print("---------loss             : %.4f" % loss.item())
+            print("---------loss   : %.4f" % loss.item())
 
             writer.add_scalar('loss', loss.item(), global_step=i+train_pics*epoch)
 
@@ -653,7 +660,7 @@ def train_multiscale():
             # depth_sample_whole = depth_sample_whole.squeeze().detach().cpu().numpy()
             # depth_sample_whole = (255.0*cm(depth_sample_whole)).astype('uint8')
 
-            rgb_scale2 = rgb_scale2.squeeze().permute(1, 2, 0).detach().cpu().numpy()
+            # rgb_scale2 = rgb_scale2.squeeze().permute(1, 2, 0).detach().cpu().numpy()
 
             if (i % 30 == 0):
                 writer.add_image('groundtruth and out', 
@@ -666,25 +673,22 @@ def train_multiscale():
                 #     global_step=i+train_pics*epoch,
                 #     dataformats='HWC')
 
-        savefilename = './checkpoints/' + run_file_name + "_" + str(epoch)+'.tar'
-        torch.save(net.state_dict(), savefilename)
-
         # evaluation
-        # nyu_dataset_eval = nyu.NYUDatasetAll(filelistpath="./data/nyudepthv2_valid.txt",
-        #                             transform=transforms.Compose([nyu.Rescale_Multiscale \
-        #                                                          (raw_resolution, reso_scale2, reso_scale4, reso_scale8), 
-        #                                                     nyu.ToTensor_Multiscale(),
-        #                                                     nyu.SamplePoint_Multiscale \
-        #                                                         (reso_scale8, sample_num)]))
-        # dataloader_eval = DataLoader(nyu_dataset_eval, batch_size=batch_num, shuffle=shuffle_bool, drop_last=True)
-
         nyu_dataset_eval = nyu.NYUDatasetAll(filelistpath="./data/nyudepthv2_valid.txt",
-                                             transform=transforms.Compose([nyu.Rescale(reso_scale2, 
-                                                                                       data_gain=False), 
-                                                                    nyu.ToTensor(),
-                                                                    nyu.SamplePoint(reso=reso_scale2, 
-                                                                                    sample_=sample_num)]))
+                                    transform=transforms.Compose([nyu.Rescale_Multiscale \
+                                                                 (raw_resolution, reso_scale2, reso_scale4, reso_scale8), 
+                                                            nyu.ToTensor_Multiscale(),
+                                                            nyu.SamplePoint_Multiscale \
+                                                                (reso_scale4, sample_num)]))
         dataloader_eval = DataLoader(nyu_dataset_eval, batch_size=batch_num, shuffle=shuffle_bool, drop_last=True)
+
+        # nyu_dataset_eval = nyu.NYUDatasetAll(filelistpath="./data/nyudepthv2_valid.txt",
+        #                                      transform=transforms.Compose([nyu.Rescale(reso_scale2, 
+        #                                                                                data_gain=False), 
+        #                                                             nyu.ToTensor(),
+        #                                                             nyu.SamplePoint(reso=reso_scale2, 
+        #                                                                             sample_=sample_num)]))
+        # dataloader_eval = DataLoader(nyu_dataset_eval, batch_size=batch_num, shuffle=shuffle_bool, drop_last=True)
 
         it = iter(dataloader_eval)
 
@@ -713,7 +717,7 @@ def train_multiscale():
                 depth_sample_whole = sample_dict['depth_sample_whole'].to(device)
 
                 # loss1, predict_depth, pre_scale4, pre_scale8 = net(rgb_scale8, rgb_scale4, rgb_scale2, depth_sample_whole)
-                _, depth_finetune_1, depth_finetune_2, predict_init_depth = net(rgb_scale4, rgb_scale2, depth_sample_whole)
+                _, __, ___, depth_finetune_1, depth_finetune_2, predict_init_depth = net(rgb_scale4, rgb_scale2, depth_sample_whole)
                 predict_depth = upsample_visual(depth_finetune_2)
 
                 loss_dict = evaluation(disp_gt_raw, predict_depth)
@@ -758,7 +762,262 @@ def train_multiscale():
         writer.add_scalar('DELTA2', del_2_total, global_step=epoch)
         writer.add_scalar('DELTA3', del_3_total, global_step=epoch)
 
+        savefilename = './checkpoints/' + run_file_name + '_rmse_' + str(rmse_total) + '_rel_' + str(rel_total) \
+                        + "_epoch_" + str(epoch)+'.tar'
+        torch.save(net.state_dict(), savefilename)
+
+
+def lin2img(tensor, image_resolution=None):
+    batch_size, num_samples, channels = tensor.shape
+    if image_resolution is None:
+        width = np.sqrt(num_samples).astype(int)
+        height = width
+    else:
+        height = image_resolution[0]
+        width = image_resolution[1]
+
+    return tensor.permute(0, 2, 1).view(batch_size, channels, height, width)
+
+
+def grads2img(gradients):
+    mG = gradients.detach().squeeze(0).permute(-2, -1, -3).cpu()
+
+    # assumes mG is [row,cols,2]
+    nRows = mG.shape[0]
+    nCols = mG.shape[1]
+    mGr = mG[:, :, 0]
+    mGc = mG[:, :, 1]
+    mGa = np.arctan2(mGc, mGr)
+    mGm = np.hypot(mGc, mGr)
+    mGhsv = np.zeros((nRows, nCols, 3), dtype=np.float32)
+    mGhsv[:, :, 0] = (mGa + math.pi) / (2. * math.pi)
+    mGhsv[:, :, 1] = 1.
+
+    nPerMin = np.percentile(mGm, 5)
+    nPerMax = np.percentile(mGm, 95)
+    mGm = (mGm - nPerMin) / (nPerMax - nPerMin)
+    mGm = np.clip(mGm, 0, 1)
+
+    mGhsv[:, :, 2] = mGm
+    mGrgb = colors.hsv_to_rgb(mGhsv)
+    return torch.from_numpy(mGrgb).permute(2, 0, 1)
+
+def divergence(y, x):
+    div = 0.
+    for i in range(y.shape[-1]):
+        div += torch.autograd.grad(y[..., i], x, torch.ones_like(y[..., i]), create_graph=True)[0][..., i:i+1]
+    return div
+
+def rescale_img(x, mode='scale', perc=None, tmax=1.0, tmin=0.0):
+    if (mode == 'scale'):
+        if perc is None:
+            xmax = torch.max(x)
+            xmin = torch.min(x)
+        else:
+            xmin = np.percentile(x.detach().cpu().numpy(), perc)
+            xmax = np.percentile(x.detach().cpu().numpy(), 100 - perc)
+            x = torch.clamp(x, xmin, xmax)
+        if xmin == xmax:
+            return 0.5 * torch.ones_like(x) * (tmax - tmin) + tmin
+        x = ((x - xmin) / (xmax - xmin)) * (tmax - tmin) + tmin
+    elif (mode == 'clamp'):
+        x = torch.clamp(x, 0, 1)
+    return x
+
+def to_uint8(x):
+    return (255. * x).astype(np.uint8)
+
+def train_update():
+    learning_rate = 4e-4
+    net = fc.Siren3dEstimation(resolution, sample_num, reso_scale2, raw_resolution)
+    net = net.to(device)
+    # net.load_state_dict(torch.load("./checkpoints/unet_baseline.tar"))
+    net_optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate, weight_decay=5e-4)
+
+    nyu_dataset = nyu.NYUDatasetAll(filelistpath="./data/nyudepthv2_train.txt",
+                                    transform=transforms.Compose([nyu.Rescale_update(resolution, reso_scale2), 
+                                                                nyu.ToTensor_update(),
+                                                                nyu.SamplePoint_update(resolution, sample_num)]))
+    dataloader = DataLoader(nyu_dataset, batch_size=batch_num, shuffle=shuffle_bool, drop_last=True)
+    
+    lossfunction = LossFunction().to(device)
+    writer = SummaryWriter(log_dir='runs/' + run_file_name)
+
+    for epoch in range(total_epochs):
+        net.train()
+        it = iter(dataloader)
+
+        for i in range(train_pics):
+            time_1 = time.time()
+            try:
+                sample_dict = next(it)
+            except:
+                continue
+
+            rgb_resize = sample_dict['rgb_resize'].to(device)
+            depth_resize = sample_dict['depth_resize'].to(device)
+            rgb_img_raw = sample_dict['rgb_img_raw'].to(device)
+            disp_gt_raw = sample_dict['disp_gt_raw'].to(device)
+            depth_sample_whole = sample_dict['depth_sample_whole'].to(device)
+            gt_gradient = sample_dict['gt_gradient'].to(device)
+            index_list = sample_dict['index_list'].to(device, dtype=torch.float32)
+            rgb_scale2 = sample_dict['rgb_scale2'].to(device)
+            gt_laplace = sample_dict['gt_laplace']
+            index_list.requires_grad = True
+
+            loss1, predict_init_depth, predict_final = net(rgb_resize, rgb_scale2, rgb_img_raw, depth_sample_whole, index_list)
+
+            grad_outputs = torch.ones_like(predict_init_depth).to(device)
+            pre_grad = torch.autograd.grad(predict_init_depth, index_list, grad_outputs=grad_outputs, create_graph=True)[0]
+
+            # pre_laplace = divergence(pre_grad, index_list)
+
+            # print("11111111111", gt_laplace.size())
+            # print("22222222222", pre_laplace.size())
+
+            mask = depth_resize > 0
+            loss2 = lossfunction(depth_resize, predict_init_depth, mask=mask)
+            mask_raw = disp_gt_raw > 0
+            loss3 = lossfunction(disp_gt_raw, predict_final, mask=mask_raw)
+
+            mask = mask.squeeze(0).reshape(1, -1, 1)
+            mask = torch.cat((mask, mask), dim=2)
+            pre_grad = pre_grad.permute(0, 2, 1)
+            grad_loss = lossfunction(gt_gradient, pre_grad, mask=mask)
+            loss = grad_loss + loss1 + loss2 + loss3
+
+            net.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 10)
+            net_optimizer.step()
+
+            print(run_file_name + ' Epoch:'+str(epoch)+' Pic:'+str(i)+" Using: %.2f s"%(time.time()-time_1))
+            print("---------loss   : %.4f" % loss.item())
+
+            writer.add_scalar('loss', loss.item(), global_step=i+train_pics*epoch)
+
+            predict_init_depth = upsample_visual(predict_init_depth)
+
+            disp_gt_raw = disp_gt_raw / 10
+            disp_gt_raw = disp_gt_raw.squeeze().detach().cpu().numpy()
+            disp_gt_raw = (255.0*cm(disp_gt_raw)).astype('uint8')
+
+            predict_init_depth = predict_init_depth / 10
+            predict_init_depth = predict_init_depth.squeeze().detach().cpu().numpy()
+            predict_init_depth = (255.0*cm(predict_init_depth)).astype('uint8')
+
+            predict_final = predict_final / 10
+            predict_final = predict_final.squeeze().detach().cpu().numpy()
+            predict_final = (255.0*cm(predict_final)).astype('uint8')
+
+            gt_gradient_img = grads2img(lin2img(gt_gradient, image_resolution=resolution)).permute(1, 2, 0).numpy()
+            pre_gradient_img = grads2img(lin2img(pre_grad, image_resolution=resolution)).permute(1, 2, 0).numpy()
+
+            # gt_laplace_img = cv2.cvtColor(cv2.applyColorMap(to_uint8(rescale_img(
+            # lin2img(gt_laplace, image_resolution=resolution), perc=2).permute(0, 2, 3, 1).squeeze(0).detach().cpu().numpy()), \
+            # cmapy.cmap('RdBu')), cv2.COLOR_BGR2RGB)
+
+            # pre_laplace_img = cv2.cvtColor(cv2.applyColorMap(to_uint8(rescale_img(
+            # lin2img(pre_laplace, image_resolution=resolution), perc=2).permute(0, 2, 3, 1).squeeze(0).detach().cpu().numpy()), \
+            # cmapy.cmap('RdBu')), cv2.COLOR_BGR2RGB)
+
+            if (i % 30 == 0):
+            # if (epoch % 10 == 0):
+                writer.add_image('groundtruth and out', 
+                    # np.concatenate((depth_scale2, depth_sample_whole, predict_depth, pre_scale4, pre_scale8), axis=1),
+                    np.concatenate((disp_gt_raw, predict_init_depth, predict_final), axis=1),
+                    global_step=i+train_pics*epoch,
+                    dataformats='HWC')
+
+                writer.add_image('gt_grad and pre_grad',
+                    np.concatenate((gt_gradient_img, pre_gradient_img), axis=1),
+                    global_step=i+train_pics*epoch,
+                    dataformats='HWC')
+
+        # evaluation
+        nyu_dataset_eval = nyu.NYUDatasetAll(filelistpath="./data/nyudepthv2_valid.txt",
+                                    transform=transforms.Compose([nyu.Rescale_update(resolution, reso_scale2), 
+                                                                nyu.ToTensor_update(),
+                                                                nyu.SamplePoint_update(resolution, sample_num)]))
+        dataloader_eval = DataLoader(nyu_dataset_eval, batch_size=batch_num, shuffle=shuffle_bool, drop_last=True)
+
+        it = iter(dataloader_eval)
+
+        pbar = tqdm(total=eval_pics)
+
+        rmse_total = 0.0
+        mae_total = 0.0
+        irmse_total = 0.0
+        imae_total = 0.0
+        rel_total = 0.0
+        del_1_total = 0.0
+        del_2_total = 0.0
+        del_3_total = 0.0
+
+        for i in range(eval_pics):
+            with torch.no_grad():
+                try:
+                    sample_dict = next(it)
+                except:
+                    continue
+
+                rgb_resize = sample_dict['rgb_resize'].to(device)
+                depth_sample_whole = sample_dict['depth_sample_whole'].to(device)
+                index_list = sample_dict['index_list'].to(device)
+                disp_gt_raw = sample_dict['disp_gt_raw'].to(device)
+                rgb_scale2 = sample_dict['rgb_scale2'].to(device)
+                rgb_img_raw = sample_dict['rgb_img_raw'].to(device)
+
+                _, __, predict_final = net(rgb_resize, rgb_scale2, rgb_img_raw, depth_sample_whole, index_list)
+
+                loss_dict = evaluation(disp_gt_raw, predict_final)
+
+                rmse = loss_dict['rmse'].item()
+                mae = loss_dict["mae"].item()
+                irmse = loss_dict["irmse"].item()
+                imae = loss_dict["imae"].item()
+                rel = loss_dict["rel"].item()
+                del_1 = loss_dict["del_1"].item()
+                del_2 = loss_dict["del_2"].item()
+                del_3 = loss_dict["del_3"].item()
+
+                rmse_total += rmse
+                mae_total += mae
+                irmse_total += irmse
+                imae_total += imae
+                rel_total += rel
+                del_1_total += del_1
+                del_2_total += del_2
+                del_3_total += del_3
+
+                error_str = 'RMSE= {:.3f} | REL= {:.3f} | D1= {:.3f} | D2= {:.3f} | D3= {:.3f}'.format(
+                            rmse, rel, del_1, del_2, del_3)
+                pbar.set_description(error_str)
+                pbar.update(1)
+
+        rmse_total = rmse_total / eval_pics
+        rel_total = rel_total / eval_pics
+        del_1_total = del_1_total / eval_pics
+        del_2_total = del_2_total / eval_pics
+        del_3_total = del_3_total / eval_pics
+        print("rmse is: ", rmse_total)
+        print("rel is: ", rel_total)
+        print("d1 is: ", del_1_total)
+        print("d2 is: ", del_2_total)
+        print("d3 is: ", del_3_total)
+
+        writer.add_scalar('RMSE', rmse_total, global_step=epoch)
+        writer.add_scalar('REL', rel_total, global_step=epoch)
+        writer.add_scalar('DELTA1', del_1_total, global_step=epoch)
+        writer.add_scalar('DELTA2', del_2_total, global_step=epoch)
+        writer.add_scalar('DELTA3', del_3_total, global_step=epoch)
+
+        savefilename = './checkpoints/' + run_file_name + '_rmse_' + str(rmse_total) + '_rel_' + str(rel_total) \
+                        + "_epoch_" + str(epoch)+'.tar'
+        torch.save(net.state_dict(), savefilename)
+
 
 if __name__ == '__main__':
     # train_main()
-    train_multiscale()
+    # train_multiscale()
+    train_update()
