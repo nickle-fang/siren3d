@@ -6,6 +6,7 @@ import os
 import cv2
 import math
 import cmapy
+import scipy
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
@@ -22,26 +23,26 @@ from model import fc_basefunction as fc
 
 
 batch_num = 1
-shuffle_bool = False
+shuffle_bool = True
 eval_bool = True
-train_pics = 47584
+train_pics = 8000#47584
 eval_pics = 654
 total_epochs = 20000
-sample_num = 250
+sample_num = 1000
 final_layer = 256 # also in other files
 feature_map_layers = 256
-resolution = (120, 160)
+resolution = (228, 304)
 raw_resolution = (480, 640)
 reso_scale2 = (240, 320)
 reso_scale4 = (120, 160)
 reso_scale8 = (64, 80)
 lamda1 = 1 # loss_1
 lamda2 = 1 # loss_2
-# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-# os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-run_file_name = "grad_finetune"
+run_file_name = "test_shuffle"
 use_dxdy = True
 data_gain_bool = True
 
@@ -102,7 +103,7 @@ class Sobel(torch.nn.Module):
 
     def forward(self, x):
         out = self.edge_conv(x) 
-        out = out.contiguous().view(-1, 2, x.size(2), x.size(3))
+        out = -out.contiguous().view(-1, 2, x.size(2), x.size(3))
 
         return out
 
@@ -135,14 +136,12 @@ def position_encoding(tensor):
     # encoded = torch.cat((torch.sin((2**0)*math.pi*x), torch.cos((2**0)*math.pi*x),
     #                     torch.sin((2**0)*math.pi*y), torch.cos((2**0)*math.pi*y)), dim=1)
     encoded = torch.cat((x, x, y, y), dim=1)
-    for i in range(4):
+    for i in range(9):
         encoded = torch.cat((encoded, 
                             torch.sin((2**(i))*math.pi*x), torch.cos((2**(i))*math.pi*x),
                             torch.sin((2**(i))*math.pi*y), torch.cos((2**(i))*math.pi*y)), dim=1)
 
-        # encoded = torch.cat((encoded, x, x, y, y), dim=1)
-
-    return encoded.permute(0, 2, 1)
+    return encoded
 
 
 def evaluation(gt, predict_depth, t_valid=0.001):
@@ -828,23 +827,37 @@ def to_uint8(x):
     return (255. * x).astype(np.uint8)
 
 def train_update():
-    learning_rate = 4e-4
-    net = fc.Siren3dEstimation(resolution, sample_num, reso_scale2, raw_resolution)
+    net_learning_rate = 1e-5
+    finetune_learning_rate = 1e-5
+    conv_init_learning_rate = 1e-5
+    net = fc.Siren3dEstimation(sample_num)
+    finetune = fc.Finetune()
+    convinit = fc.ConvInit()
     net = net.to(device)
-    # net.load_state_dict(torch.load("./checkpoints/unet_baseline.tar"))
-    net_optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate, weight_decay=5e-4)
+    finetune = finetune.to(device)
+    convinit = convinit.to(device)
+    net.load_state_dict(torch.load("./checkpoints/shuabang/baseline_net_rmse_0.19360252093261718_rel_0.05172041724991361_epoch_17.tar"))
+    finetune.load_state_dict(torch.load("./checkpoints/shuabang/baseline_finetune_rmse_0.19360252093261718_rel_0.05172041724991361_epoch_17.tar"))
+    # convinit.load_state_dict(torch.load("./checkpoints/"))
+    net_optimizer = torch.optim.Adam(net.parameters(), lr=net_learning_rate, weight_decay=5e-4)
+    finetune_optimizer = torch.optim.Adam(finetune.parameters(), lr=finetune_learning_rate, weight_decay=5e-4)
+    convinit_optimizer = torch.optim.Adam(convinit.parameters(), lr=conv_init_learning_rate, weight_decay=5e-4)
 
     nyu_dataset = nyu.NYUDatasetAll(filelistpath="./data/nyudepthv2_train.txt",
-                                    transform=transforms.Compose([nyu.Rescale_update(resolution, reso_scale2), 
+                                    transform=transforms.Compose([nyu.Rescale_update(train=True),
                                                                 nyu.ToTensor_update(),
-                                                                nyu.SamplePoint_update(resolution, sample_num)]))
+                                                                nyu.SamplePoint_update(sample_num)]))
     dataloader = DataLoader(nyu_dataset, batch_size=batch_num, shuffle=shuffle_bool, drop_last=True)
     
     lossfunction = LossFunction().to(device)
     writer = SummaryWriter(log_dir='runs/' + run_file_name)
 
+    sobel = Sobel().to(device)
+
     for epoch in range(total_epochs):
         net.train()
+        finetune.train()
+        # convinit.train()
         it = iter(dataloader)
 
         for i in range(train_pics):
@@ -854,64 +867,112 @@ def train_update():
             except:
                 continue
 
-            rgb_resize = sample_dict['rgb_resize'].to(device)
-            depth_resize = sample_dict['depth_resize'].to(device)
-            rgb_img_raw = sample_dict['rgb_img_raw'].to(device)
-            disp_gt_raw = sample_dict['disp_gt_raw'].to(device)
+            depth = sample_dict['depth'].to(device)
+            rgb = sample_dict['rgb'].to(device)
+            index_list = sample_dict['index_list'].to(device)
             depth_sample_whole = sample_dict['depth_sample_whole'].to(device)
             gt_gradient = sample_dict['gt_gradient'].to(device)
-            index_list = sample_dict['index_list'].to(device, dtype=torch.float32)
-            rgb_scale2 = sample_dict['rgb_scale2'].to(device)
-            gt_laplace = sample_dict['gt_laplace']
-            index_list.requires_grad = True
 
-            loss1, predict_init_depth, predict_final = net(rgb_resize, rgb_scale2, rgb_img_raw, depth_sample_whole, index_list)
+            index_list = index_list / torch.tensor([resolution[0]-1, resolution[1]-1]).reshape(1, 2, 1, 1).to(device)
+            # index_list = index_list * torch.tensor(2.).to(device) - torch.tensor(1.).to(device)
 
-            grad_outputs = torch.ones_like(predict_init_depth).to(device)
-            pre_grad = torch.autograd.grad(predict_init_depth, index_list, grad_outputs=grad_outputs, create_graph=True)[0]
+            filter_mask = depth > 0
+            if (filter_mask.sum() < 67000):
+                print("Bad Data!!!!!!!!!")
+                continue
+
+            index_list_copy = index_list.clone()
+
+            time_2 = time.time()
+
+            loss1, predict_init_depth = net(rgb, depth_sample_whole, index_list, index_list_copy)
+            # conv_init_depth = convinit(predict_init_depth)
+            finetune_depth = finetune(predict_init_depth, rgb)
+
+            time_3 = time.time()
+
+            # predict_init_depth_copy = predict_init_depth.clone()
+
+            # grad_outputs = torch.ones_like(predict_init_depth).to(device)
+            # pre_grad = torch.autograd.grad(predict_init_depth, index_list_copy, grad_outputs=grad_outputs, create_graph=True)[0]
 
             # pre_laplace = divergence(pre_grad, index_list)
+ 
+            mask = depth > 0
+            loss2 = lossfunction(depth, predict_init_depth, mask=mask)
+            # loss_convinit = lossfunction(depth, conv_init_depth)
+            loss3 = lossfunction(depth, finetune_depth, mask=mask)
 
-            # print("11111111111", gt_laplace.size())
-            # print("22222222222", pre_laplace.size())
+            gt_depth_resize_sobel = sobel(depth)
+            pre_init_sobel = sobel(predict_init_depth)
+            # conv_init_sobel = sobel(conv_init_depth)
+            finetune_sobel = sobel(finetune_depth)
+            grad_loss_init = lossfunction(gt_depth_resize_sobel, pre_init_sobel)
+            # grad_loss_convinit = lossfunction(gt_depth_resize_sobel, conv_init_sobel)
+            grad_loss_finetune = lossfunction(gt_depth_resize_sobel, finetune_sobel)
 
-            mask = depth_resize > 0
-            loss2 = lossfunction(depth_resize, predict_init_depth, mask=mask)
-            mask_raw = disp_gt_raw > 0
-            loss3 = lossfunction(disp_gt_raw, predict_final, mask=mask_raw)
+            # mask = mask.squeeze(0).reshape(1, -1, 1)
+            # mask = torch.cat((mask, mask), dim=2)
+            # pre_grad = pre_grad.permute(0, 2, 1)
+            # grad_loss = lossfunction(gt_gradient, pre_grad, mask=mask)
 
-            mask = mask.squeeze(0).reshape(1, -1, 1)
-            mask = torch.cat((mask, mask), dim=2)
-            pre_grad = pre_grad.permute(0, 2, 1)
-            grad_loss = lossfunction(gt_gradient, pre_grad, mask=mask)
-            loss = grad_loss + loss1 + loss2 + loss3
+            loss = loss1 + loss2 + grad_loss_init + loss3 + grad_loss_finetune
+                                #  + loss_convinit + grad_loss_convinit
+                                 # + 0.05*grad_loss
 
             net.zero_grad()
+            finetune.zero_grad()
+            # convinit.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 10)
+            torch.nn.utils.clip_grad_norm_(finetune.parameters(), 10)
+            # torch.nn.utils.clip_grad_norm_(convinit.parameters(), 10)
             net_optimizer.step()
+            finetune_optimizer.step()
+            # convinit_optimizer.step()
+
+            time_4 = time.time()
 
             print(run_file_name + ' Epoch:'+str(epoch)+' Pic:'+str(i)+" Using: %.2f s"%(time.time()-time_1))
             print("---------loss   : %.4f" % loss.item())
 
             writer.add_scalar('loss', loss.item(), global_step=i+train_pics*epoch)
 
-            predict_init_depth = upsample_visual(predict_init_depth)
+            # visualization
+            gt_visual_init_sobel = torch.cat((gt_depth_resize_sobel[:, 0, :, :].reshape(-1, 1), 
+                                           gt_depth_resize_sobel[:, 1, :, :].reshape(-1, 1)), dim=-1).unsqueeze(0)
+            pre_visual_init_sobel = torch.cat((pre_init_sobel[:, 0, :, :].reshape(-1, 1), 
+                                           pre_init_sobel[:, 1, :, :].reshape(-1, 1)), dim=-1).unsqueeze(0)
+            gt_visual_init_sobel_img = grads2img(lin2img(gt_visual_init_sobel, image_resolution=resolution)).permute(1, 2, 0).numpy()
+            pre_visual_init_sobel_img = grads2img(lin2img(pre_visual_init_sobel, image_resolution=resolution)).permute(1, 2, 0).numpy()
 
-            disp_gt_raw = disp_gt_raw / 10
-            disp_gt_raw = disp_gt_raw.squeeze().detach().cpu().numpy()
-            disp_gt_raw = (255.0*cm(disp_gt_raw)).astype('uint8')
+            depth = depth / 10
+            depth = depth.squeeze().detach().cpu().numpy()
+            depth = (255.0*cm(depth)).astype('uint8')
 
             predict_init_depth = predict_init_depth / 10
             predict_init_depth = predict_init_depth.squeeze().detach().cpu().numpy()
             predict_init_depth = (255.0*cm(predict_init_depth)).astype('uint8')
 
-            predict_final = predict_final / 10
-            predict_final = predict_final.squeeze().detach().cpu().numpy()
-            predict_final = (255.0*cm(predict_final)).astype('uint8')
+            # conv_init_depth = conv_init_depth / 10
+            # conv_init_depth = conv_init_depth.squeeze().detach().cpu().numpy()
+            # conv_init_depth = (255.0*cm(conv_init_depth)).astype('uint8')
 
-            gt_gradient_img = grads2img(lin2img(gt_gradient, image_resolution=resolution)).permute(1, 2, 0).numpy()
-            pre_gradient_img = grads2img(lin2img(pre_grad, image_resolution=resolution)).permute(1, 2, 0).numpy()
+            finetune_depth = finetune_depth / 10
+            finetune_depth = finetune_depth.squeeze().detach().cpu().numpy()
+            finetune_depth = (255.0*cm(finetune_depth)).astype('uint8')
+            ################################################################
+
+            # gt_gradient_img = grads2img(lin2img(gt_gradient, image_resolution=resolution)).permute(1, 2, 0).numpy()
+            # pre_gradient_img = grads2img(lin2img(pre_grad, image_resolution=resolution)).permute(1, 2, 0).numpy()
+
+            # predict_init_depth_copy = predict_init_depth_copy.squeeze(1).detach().cpu()
+            # pre_sobel_gradx = scipy.ndimage.sobel(predict_init_depth_copy.numpy(), axis=1).squeeze(0)[..., None]
+            # pre_sobel_grady = scipy.ndimage.sobel(predict_init_depth_copy.numpy(), axis=2).squeeze(0)[..., None]
+            # pre_sobelgt_gradient = torch.cat((torch.from_numpy(pre_sobel_gradx).reshape(-1, 1),
+            #                                     torch.from_numpy(pre_sobel_grady).reshape(-1, 1)),
+            #                                     dim=-1).unsqueeze(0)
+            # pre_sobel_img = grads2img(lin2img(pre_sobelgt_gradient, image_resolution=resolution)).permute(1, 2, 0).numpy()
 
             # gt_laplace_img = cv2.cvtColor(cv2.applyColorMap(to_uint8(rescale_img(
             # lin2img(gt_laplace, image_resolution=resolution), perc=2).permute(0, 2, 3, 1).squeeze(0).detach().cpu().numpy()), \
@@ -921,25 +982,40 @@ def train_update():
             # lin2img(pre_laplace, image_resolution=resolution), perc=2).permute(0, 2, 3, 1).squeeze(0).detach().cpu().numpy()), \
             # cmapy.cmap('RdBu')), cv2.COLOR_BGR2RGB)
 
-            if (i % 30 == 0):
+            depth_sample_whole = depth_sample_whole.squeeze().detach().cpu().numpy()
+            depth_sample_whole = cv2.cvtColor(depth_sample_whole, cv2.COLOR_GRAY2BGR)
+
+            if (i % 20 == 0):
             # if (epoch % 10 == 0):
                 writer.add_image('groundtruth and out', 
                     # np.concatenate((depth_scale2, depth_sample_whole, predict_depth, pre_scale4, pre_scale8), axis=1),
-                    np.concatenate((disp_gt_raw, predict_init_depth, predict_final), axis=1),
+                    np.concatenate((depth, predict_init_depth, finetune_depth), axis=1), #, conv_init_depth
                     global_step=i+train_pics*epoch,
                     dataformats='HWC')
 
                 writer.add_image('gt_grad and pre_grad',
-                    np.concatenate((gt_gradient_img, pre_gradient_img), axis=1),
+                    # np.concatenate((gt_visual_init_sobel_img, pre_visual_init_sobel_img, pre_gradient_img, depth_sample_whole), axis=1),
+                    np.concatenate((gt_visual_init_sobel_img, pre_visual_init_sobel_img, depth_sample_whole), axis=1),
                     global_step=i+train_pics*epoch,
                     dataformats='HWC')
 
+        for p in net_optimizer.param_groups:
+            p['lr'] *= 0.9
+        for p in finetune_optimizer.param_groups:
+            p['lr'] *= 0.9
+        # for p in convinit_optimizer.param_groups:
+        #     p['lr'] *= 0.9
+        
         # evaluation
+        net.eval()
+        finetune.eval()
+        # convinit.eval()
+
         nyu_dataset_eval = nyu.NYUDatasetAll(filelistpath="./data/nyudepthv2_valid.txt",
-                                    transform=transforms.Compose([nyu.Rescale_update(resolution, reso_scale2), 
+                                    transform=transforms.Compose([nyu.Rescale_update(train=False), 
                                                                 nyu.ToTensor_update(),
-                                                                nyu.SamplePoint_update(resolution, sample_num)]))
-        dataloader_eval = DataLoader(nyu_dataset_eval, batch_size=batch_num, shuffle=shuffle_bool, drop_last=True)
+                                                                nyu.SamplePoint_update(sample_num)]))
+        dataloader_eval = DataLoader(nyu_dataset_eval, batch_size=1, shuffle=False, drop_last=True)
 
         it = iter(dataloader_eval)
 
@@ -954,6 +1030,15 @@ def train_update():
         del_2_total = 0.0
         del_3_total = 0.0
 
+        rmse_total_finetune = 0.0
+        mae_total_finetune = 0.0
+        irmse_total_finetune = 0.0
+        imae_total_finetune = 0.0
+        rel_total_finetune = 0.0
+        del_1_total_finetune = 0.0
+        del_2_total_finetune = 0.0
+        del_3_total_finetune = 0.0
+
         for i in range(eval_pics):
             with torch.no_grad():
                 try:
@@ -961,16 +1046,23 @@ def train_update():
                 except:
                     continue
 
-                rgb_resize = sample_dict['rgb_resize'].to(device)
-                depth_sample_whole = sample_dict['depth_sample_whole'].to(device)
+                depth = sample_dict['depth'].to(device)
+                rgb = sample_dict['rgb'].to(device)
                 index_list = sample_dict['index_list'].to(device)
-                disp_gt_raw = sample_dict['disp_gt_raw'].to(device)
-                rgb_scale2 = sample_dict['rgb_scale2'].to(device)
-                rgb_img_raw = sample_dict['rgb_img_raw'].to(device)
+                depth_sample_whole = sample_dict['depth_sample_whole'].to(device)
+                gt_gradient = sample_dict['gt_gradient'].to(device)
 
-                _, __, predict_final = net(rgb_resize, rgb_scale2, rgb_img_raw, depth_sample_whole, index_list)
+                index_list = index_list / torch.tensor([resolution[0]-1, resolution[1]-1]).reshape(1, 2, 1, 1).to(device)
+                # index_list = index_list * torch.tensor(2.).to(device) - torch.tensor(1.).to(device)
 
-                loss_dict = evaluation(disp_gt_raw, predict_final)
+                index_list_copy = index_list.clone()
+
+                loss1, predict_init_depth = net(rgb, depth_sample_whole, index_list, index_list_copy)
+                # conv_init_depth = convinit(predict_init_depth)
+                finetune_depth = finetune(predict_init_depth, rgb)
+
+                loss_dict = evaluation(depth, predict_init_depth)
+                loss_dict_finetune = evaluation(depth, finetune_depth)
 
                 rmse = loss_dict['rmse'].item()
                 mae = loss_dict["mae"].item()
@@ -990,7 +1082,25 @@ def train_update():
                 del_2_total += del_2
                 del_3_total += del_3
 
-                error_str = 'RMSE= {:.3f} | REL= {:.3f} | D1= {:.3f} | D2= {:.3f} | D3= {:.3f}'.format(
+                rmse_finetune = loss_dict_finetune['rmse'].item()
+                mae_finetune = loss_dict_finetune["mae"].item()
+                irmse_finetune = loss_dict_finetune["irmse"].item()
+                imae_finetune = loss_dict_finetune["imae"].item()
+                rel_finetune = loss_dict_finetune["rel"].item()
+                del_1_finetune = loss_dict_finetune["del_1"].item()
+                del_2_finetune = loss_dict_finetune["del_2"].item()
+                del_3_finetune = loss_dict_finetune["del_3"].item()
+
+                rmse_total_finetune += rmse_finetune
+                mae_total_finetune += mae_finetune
+                irmse_total_finetune += irmse_finetune
+                imae_total_finetune += imae_finetune
+                rel_total_finetune += rel_finetune
+                del_1_total_finetune += del_1_finetune
+                del_2_total_finetune += del_2_finetune
+                del_3_total_finetune += del_3_finetune
+
+                error_str = 'RMSE={:.3f} | REL={:.3f} | D1={:.3f} | D2={:.3f} | D3={:.3f}'.format(
                             rmse, rel, del_1, del_2, del_3)
                 pbar.set_description(error_str)
                 pbar.update(1)
@@ -1000,6 +1110,13 @@ def train_update():
         del_1_total = del_1_total / eval_pics
         del_2_total = del_2_total / eval_pics
         del_3_total = del_3_total / eval_pics
+
+        rmse_total_finetune = rmse_total_finetune / eval_pics
+        rel_total_finetune = rel_total_finetune / eval_pics
+        del_1_total_finetune = del_1_total_finetune / eval_pics
+        del_2_total_finetune = del_2_total_finetune / eval_pics
+        del_3_total_finetune = del_3_total_finetune / eval_pics
+
         print("rmse is: ", rmse_total)
         print("rel is: ", rel_total)
         print("d1 is: ", del_1_total)
@@ -1012,12 +1129,353 @@ def train_update():
         writer.add_scalar('DELTA2', del_2_total, global_step=epoch)
         writer.add_scalar('DELTA3', del_3_total, global_step=epoch)
 
-        savefilename = './checkpoints/' + run_file_name + '_rmse_' + str(rmse_total) + '_rel_' + str(rel_total) \
-                        + "_epoch_" + str(epoch)+'.tar'
-        torch.save(net.state_dict(), savefilename)
+        writer.add_scalar('RMSE_finetune', rmse_total_finetune, global_step=epoch)
+        writer.add_scalar('REL_finetune', rel_total_finetune, global_step=epoch)
+        writer.add_scalar('DELTA1_finetune', del_1_total_finetune, global_step=epoch)
+        writer.add_scalar('DELTA2_finetune', del_2_total_finetune, global_step=epoch)
+        writer.add_scalar('DELTA3_finetune', del_3_total_finetune, global_step=epoch)
 
+        if (rmse_total < 0.2 and rel_total < 0.06):
+            savefilename = './checkpoints/' + run_file_name + '_net' + '_rmse_' + str(rmse_total) + '_rel_' + str(rel_total) \
+                            + "_epoch_" + str(epoch)+'.tar'
+            torch.save(net.state_dict(), savefilename)
+
+            savefilename = './checkpoints/' + run_file_name + '_finetune' '_rmse_' + str(rmse_total) + '_rel_' + str(rel_total) \
+                            + "_epoch_" + str(epoch)+'.tar'
+            torch.save(finetune.state_dict(), savefilename)
+
+            # savefilename = './checkpoints/' + run_file_name + '_convinit' '_rmse_' + str(rmse_total) + '_rel_' + str(rel_total) \
+            #                 + "_epoch_" + str(epoch)+'.tar'
+            # torch.save(convinit.state_dict(), savefilename)
+
+
+def May_Net():
+    feature_ex_net = fc.FeatureExtractionNet().to(device)
+    # fc_net = fc.FullConnected_baseline().to(device)
+    fc_net = fc.Conv_1d().to(device)
+    finetune_net = fc.Finetune().to(device)
+
+    feature_ex_net.load_state_dict(torch.load("./checkpoints/pretrained/feature_extract_pretrained.tar"))
+    # fc_net.load_state_dict(torch.load("./checkpoints/pretrained/fullconnect_pretrained.tar"))
+    finetune_net.load_state_dict(torch.load("./checkpoints/pretrained/finetune_pretrained.tar"))
+
+    feature_ex_net_optimizer = torch.optim.Adam(feature_ex_net.parameters(), lr=1e-5, weight_decay=5e-4)
+    fc_net_optimizer = torch.optim.Adam(fc_net.parameters(), lr=4e-5, weight_decay=5e-4)
+    finetune_net_optimizer = torch.optim.Adam(finetune_net.parameters(), lr=1e-5, weight_decay=5e-4)
+
+    nyu_dataset = nyu.NYUDatasetAll(filelistpath="./data/nyudepthv2_train.txt",
+                                    transform=transforms.Compose([nyu.Rescale_update(train=True),
+                                                                nyu.ToTensor_update(),
+                                                                nyu.SamplePoint_update(sample_num)]))
+    dataloader = DataLoader(nyu_dataset, batch_size=batch_num, shuffle=shuffle_bool, drop_last=True)
+    
+    lossfunction = LossFunction().to(device)
+    writer = SummaryWriter(log_dir='runs/' + run_file_name)
+
+    sobel = Sobel().to(device)
+
+    for epoch in range(total_epochs):
+        feature_ex_net.train()
+        fc_net.train()
+        finetune_net.train()
+        it = iter(dataloader)
+
+        for i in range(train_pics):
+            time_1 = time.time()
+            try:
+                sample_dict = next(it)
+            except:
+                continue
+
+            depth = sample_dict['depth'].to(device)
+            rgb = sample_dict['rgb'].to(device)
+            index_list = sample_dict['index_list'].to(device)
+            depth_sample_whole = sample_dict['depth_sample_whole'].to(device)
+            gt_gradient = sample_dict['gt_gradient'].to(device)
+
+            filter_mask = depth > 0
+            if (filter_mask.sum() < 67000):
+                print("Bad Data!!!!!!!!!")
+                continue
+
+            index_list = index_list / torch.tensor([resolution[0]-1, resolution[1]-1]).reshape(1, 2, 1, 1).to(device)
+            # index_list = index_list * torch.tensor(2.).to(device) - torch.tensor(1.).to(device)
+
+            time_2 = time.time()
+
+            ###############################
+            # get feature map from rgb
+            featuremap = feature_ex_net(rgb)
+
+            sample_mask = depth_sample_whole >= 0
+            depth_sample = torch.masked_select(depth_sample_whole, sample_mask)
+            depth_sample = depth_sample.reshape(sample_num, 1)
+            feature_map_with_pose = torch.cat((featuremap, position_encoding(index_list)), dim=1)
+
+            feature_map_with_pose_layers = feature_map_with_pose.size()[1] # 256 + position_layers
+            fc_in = feature_map_with_pose.reshape(feature_map_with_pose_layers, 228*304).permute(1, 0)
+            fc_in = fc_in.permute(1, 0).unsqueeze(0)
+            fc_out = fc_net(fc_in) # 69312 * 256
+            fc_out = fc_out.squeeze().permute(1, 0)
+            # print("fffffffffffffffffff", fc_out.size())
+
+            fc_out_sample = fc_out.permute(1, 0).view(1, 256, 228, 304)
+            fc_out_sample = torch.masked_select(fc_out_sample, sample_mask)
+            fc_out_sample = fc_out_sample.reshape(fc_out.size()[1], sample_num).permute(1, 0) # 1000 * 256
+
+            # least_squres to GET W!
+            fc_out_sample_trans = fc_out_sample.permute(1, 0)
+            new_a = torch.matmul(fc_out_sample_trans, fc_out_sample)
+            new_b = torch.matmul(fc_out_sample_trans, depth_sample)
+            w = torch.matmul(torch.inverse(new_a + 0.01*torch.eye(new_a.size()[0]).to(device)), new_b)
+
+            predict_sample = torch.matmul(fc_out_sample, w)
+            loss_lq = lossfunction(depth_sample, predict_sample)
+
+            # predict depth
+            predict_depth = torch.matmul(fc_out, w).reshape(1, 1, 228, 304)
+            finetune_depth = finetune_net(predict_depth, rgb)
+
+            # caculate loss
+            mask = depth > 0
+            loss1 = lossfunction(depth, predict_depth, mask=mask)
+            loss2 = lossfunction(depth, finetune_depth, mask=mask)
+
+            loss = loss1 + loss2 + loss_lq
+
+            feature_ex_net.zero_grad()
+            fc_net.zero_grad()
+            finetune_net.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(feature_ex_net.parameters(), 10)
+            torch.nn.utils.clip_grad_norm_(fc_net.parameters(), 10)
+            torch.nn.utils.clip_grad_norm_(finetune_net.parameters(), 10)
+            feature_ex_net_optimizer.step()
+            fc_net_optimizer.step()
+            finetune_net_optimizer.step()
+
+            time_4 = time.time()
+
+            print(run_file_name + ' Epoch:'+str(epoch)+' Pic:'+str(i)+" Using: %.2f s"%(time.time()-time_1))
+            print("---------loss   : %.4f" % loss.item())
+
+            writer.add_scalar('loss', loss.item(), global_step=i+train_pics*epoch)
+
+            # visualization
+            depth = depth / 10
+            depth = depth.squeeze().detach().cpu().numpy()
+            depth = (255.0*cm(depth)).astype('uint8')
+
+            predict_depth = predict_depth / 10
+            predict_depth = predict_depth.squeeze().detach().cpu().numpy()
+            predict_depth = (255.0*cm(predict_depth)).astype('uint8')
+
+            finetune_depth = finetune_depth / 10
+            finetune_depth = finetune_depth.squeeze().detach().cpu().numpy()
+            finetune_depth = (255.0*cm(finetune_depth)).astype('uint8')
+            ################################################################
+
+            depth_sample_whole = depth_sample_whole.squeeze().detach().cpu().numpy()
+            depth_sample_whole = cv2.cvtColor(depth_sample_whole, cv2.COLOR_GRAY2BGR)
+
+            if (i % 20 == 0):
+            # if (epoch % 10 == 0):
+                writer.add_image('groundtruth and out', 
+                    np.concatenate((depth, predict_depth, finetune_depth), axis=1),
+                    global_step=i+train_pics*epoch,
+                    dataformats='HWC')
+
+                writer.add_image('gt_grad and pre_grad',
+                    depth_sample_whole,
+                    global_step=i+train_pics*epoch,
+                    dataformats='HWC')
+
+        # for p in feature_ex_net_optimizer.param_groups:
+        #     p['lr'] *= 0.9
+        # for p in fc_net_optimizer.param_groups:
+        #     p['lr'] *= 0.9
+        # for p in finetune_net_optimizer.param_groups:
+        #     p['lr'] *= 0.9
+        
+        # evaluation
+        feature_ex_net.eval()
+        fc_net.eval()
+        finetune_net.eval()
+
+        nyu_dataset_eval = nyu.NYUDatasetAll(filelistpath="./data/nyudepthv2_valid.txt",
+                                    transform=transforms.Compose([nyu.Rescale_update(train=False), 
+                                                                nyu.ToTensor_update(),
+                                                                nyu.SamplePoint_update(sample_num)]))
+        dataloader_eval = DataLoader(nyu_dataset_eval, batch_size=1, shuffle=False, drop_last=True)
+
+        it = iter(dataloader_eval)
+
+        pbar = tqdm(total=eval_pics)
+
+        rmse_total = 0.0
+        mae_total = 0.0
+        irmse_total = 0.0
+        imae_total = 0.0
+        rel_total = 0.0
+        del_1_total = 0.0
+        del_2_total = 0.0
+        del_3_total = 0.0
+
+        rmse_total_finetune = 0.0
+        mae_total_finetune = 0.0
+        irmse_total_finetune = 0.0
+        imae_total_finetune = 0.0
+        rel_total_finetune = 0.0
+        del_1_total_finetune = 0.0
+        del_2_total_finetune = 0.0
+        del_3_total_finetune = 0.0
+
+        for i in range(eval_pics):
+            with torch.no_grad():
+                try:
+                    sample_dict = next(it)
+                except:
+                    continue
+
+                depth = sample_dict['depth'].to(device)
+                rgb = sample_dict['rgb'].to(device)
+                index_list = sample_dict['index_list'].to(device)
+                depth_sample_whole = sample_dict['depth_sample_whole'].to(device)
+                gt_gradient = sample_dict['gt_gradient'].to(device)
+
+                index_list = index_list / torch.tensor([resolution[0]-1, resolution[1]-1]).reshape(1, 2, 1, 1).to(device)
+                # index_list = index_list * torch.tensor(2.).to(device) - torch.tensor(1.).to(device)
+
+                featuremap = feature_ex_net(rgb)
+
+                sample_mask = depth_sample_whole >= 0
+                depth_sample = torch.masked_select(depth_sample_whole, sample_mask)
+                depth_sample = depth_sample.reshape(sample_num, 1)
+                feature_map_with_pose = torch.cat((featuremap, position_encoding(index_list)), dim=1)
+
+                feature_map_with_pose_layers = feature_map_with_pose.size()[1]
+                fc_in = feature_map_with_pose.reshape(feature_map_with_pose_layers, 228*304).permute(1, 0)
+                fc_in = fc_in.permute(1, 0).unsqueeze(0)
+                fc_out = fc_net(fc_in)
+                fc_out = fc_out.squeeze().permute(1, 0)
+
+                fc_out_sample = fc_out.permute(1, 0).view(1, 256, 228, 304)
+                fc_out_sample = torch.masked_select(fc_out_sample, sample_mask)
+                fc_out_sample = fc_out_sample.reshape(fc_out.size()[1], sample_num).permute(1, 0) # 1000 * 256
+
+                # least_squres to GET W!
+                fc_out_sample_trans = fc_out_sample.permute(1, 0)
+                new_a = torch.matmul(fc_out_sample_trans, fc_out_sample)
+                new_b = torch.matmul(fc_out_sample_trans, depth_sample)
+                w = torch.matmul(torch.inverse(new_a + 0.01*torch.eye(new_a.size()[0]).to(device)), new_b)
+
+                # predict depth
+                predict_depth = torch.matmul(fc_out, w).reshape(1, 1, 228, 304)
+                finetune_depth = finetune_net(predict_depth, rgb)
+
+                loss_dict = evaluation(depth, predict_depth)
+                loss_dict_finetune = evaluation(depth, finetune_depth)
+
+                rmse = loss_dict['rmse'].item()
+                mae = loss_dict["mae"].item()
+                irmse = loss_dict["irmse"].item()
+                imae = loss_dict["imae"].item()
+                rel = loss_dict["rel"].item()
+                del_1 = loss_dict["del_1"].item()
+                del_2 = loss_dict["del_2"].item()
+                del_3 = loss_dict["del_3"].item()
+
+                rmse_total += rmse
+                mae_total += mae
+                irmse_total += irmse
+                imae_total += imae
+                rel_total += rel
+                del_1_total += del_1
+                del_2_total += del_2
+                del_3_total += del_3
+
+                rmse_finetune = loss_dict_finetune['rmse'].item()
+                mae_finetune = loss_dict_finetune["mae"].item()
+                irmse_finetune = loss_dict_finetune["irmse"].item()
+                imae_finetune = loss_dict_finetune["imae"].item()
+                rel_finetune = loss_dict_finetune["rel"].item()
+                del_1_finetune = loss_dict_finetune["del_1"].item()
+                del_2_finetune = loss_dict_finetune["del_2"].item()
+                del_3_finetune = loss_dict_finetune["del_3"].item()
+
+                rmse_total_finetune += rmse_finetune
+                mae_total_finetune += mae_finetune
+                irmse_total_finetune += irmse_finetune
+                imae_total_finetune += imae_finetune
+                rel_total_finetune += rel_finetune
+                del_1_total_finetune += del_1_finetune
+                del_2_total_finetune += del_2_finetune
+                del_3_total_finetune += del_3_finetune
+
+                error_str = 'RMSE={:.3f} | REL={:.3f} | D1={:.3f} | D2={:.3f} | D3={:.3f}'.format(
+                            rmse, rel, del_1, del_2, del_3)
+                pbar.set_description(error_str)
+                pbar.update(1)
+
+        rmse_total = rmse_total / eval_pics
+        rel_total = rel_total / eval_pics
+        del_1_total = del_1_total / eval_pics
+        del_2_total = del_2_total / eval_pics
+        del_3_total = del_3_total / eval_pics
+
+        rmse_total_finetune = rmse_total_finetune / eval_pics
+        rel_total_finetune = rel_total_finetune / eval_pics
+        del_1_total_finetune = del_1_total_finetune / eval_pics
+        del_2_total_finetune = del_2_total_finetune / eval_pics
+        del_3_total_finetune = del_3_total_finetune / eval_pics
+
+        print("rmse is: ", rmse_total)
+        print("rel is: ", rel_total)
+        print("d1 is: ", del_1_total)
+        print("d2 is: ", del_2_total)
+        print("d3 is: ", del_3_total)
+
+        writer.add_scalar('RMSE', rmse_total, global_step=epoch)
+        writer.add_scalar('REL', rel_total, global_step=epoch)
+        writer.add_scalar('DELTA1', del_1_total, global_step=epoch)
+        writer.add_scalar('DELTA2', del_2_total, global_step=epoch)
+        writer.add_scalar('DELTA3', del_3_total, global_step=epoch)
+
+        writer.add_scalar('RMSE_finetune', rmse_total_finetune, global_step=epoch)
+        writer.add_scalar('REL_finetune', rel_total_finetune, global_step=epoch)
+        writer.add_scalar('DELTA1_finetune', del_1_total_finetune, global_step=epoch)
+        writer.add_scalar('DELTA2_finetune', del_2_total_finetune, global_step=epoch)
+        writer.add_scalar('DELTA3_finetune', del_3_total_finetune, global_step=epoch)
+
+        if (rmse_total < 0.2 and rel_total < 0.06):
+        # if (True):
+            savefilename = './checkpoints/' + run_file_name + '_feature' + '_rmse_' + str(rmse_total) + '_rel_' + str(rel_total) \
+                            + "_epoch_" + str(epoch)+'.tar'
+            torch.save(feature_ex_net.state_dict(), savefilename)
+
+            savefilename = './checkpoints/' + run_file_name + '_fc' '_rmse_' + str(rmse_total) + '_rel_' + str(rel_total) \
+                            + "_epoch_" + str(epoch)+'.tar'
+            torch.save(fc_net.state_dict(), savefilename)
+
+            savefilename = './checkpoints/' + run_file_name + '_finetune' '_rmse_' + str(rmse_total) + '_rel_' + str(rel_total) \
+                            + "_epoch_" + str(epoch)+'.tar'
+            torch.save(finetune_net.state_dict(), savefilename)
 
 if __name__ == '__main__':
     # train_main()
     # train_multiscale()
-    train_update()
+    # train_update()
+    # feature_ex_net = fc.FeatureExtractionNet().to(device)
+    # fullconnect_baseline = fc.FullConnected_baseline().to(device)
+    # fc_dict = fullconnect_baseline.state_dict()
+    # pretrained_dict = torch.load("./checkpoints/shuabang/baseline_net_rmse_0.19360252093261718_rel_0.05172041724991361_epoch_17.tar")
+    # pretrained_dict =  {k: v for k, v in pretrained_dict.items() if k in fc_dict}
+    # fc_dict.update(pretrained_dict)
+    # fullconnect_baseline.load_state_dict(fc_dict)
+    # torch.save(fullconnect_baseline.state_dict(), "./checkpoints/pretrained/fullconnect_pretrained.tar")
+    # feature_dict = feature_ex_net.state_dict()
+    # pretrained_dict =  {k: v for k, v in pretrained_dict.items() if k in feature_dict}
+    # feature_dict.update(pretrained_dict)
+    # feature_ex_net.load_state_dict(feature_dict)
+    # torch.save(feature_ex_net.state_dict(), "feature_extract_pretrained.tar")
+    May_Net()
