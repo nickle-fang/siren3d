@@ -1,6 +1,7 @@
 import torch
 import math
 import time
+import numpy as np
 from torchvision import models
 from torch import nn
 import torch.nn.functional as F
@@ -144,41 +145,41 @@ class FC_basefunction(nn.Module):
 
         return out
 
-class BasicBlock(nn.Module):
-    """Basic Block for Attention
-    Note: This class is modified from  https://github.com/weiaicunzai/pytorch-cifar100/blob/master/models/resnet.py
-    """
-    #BasicBlock and BottleNeck block
-    #have different output size
-    #we use class attribute expansion
-    #to distinct
-    expansion = 1
+# class BasicBlock(nn.Module):
+#     """Basic Block for Attention
+#     Note: This class is modified from  https://github.com/weiaicunzai/pytorch-cifar100/blob/master/models/resnet.py
+#     """
+#     #BasicBlock and BottleNeck block
+#     #have different output size
+#     #we use class attribute expansion
+#     #to distinct
+#     expansion = 1
 
-    def __init__(self, in_channels, out_channels, stride=1):
-        super().__init__()
+#     def __init__(self, in_channels, out_channels, stride=1):
+#         super().__init__()
 
-        #residual function
-        self.residual_function = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels * BasicBlock.expansion, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels * BasicBlock.expansion)
-        )
+#         #residual function
+#         self.residual_function = nn.Sequential(
+#             nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+#             nn.BatchNorm2d(out_channels),
+#             nn.LeakyReLU(inplace=True),
+#             nn.Conv2d(out_channels, out_channels * BasicBlock.expansion, kernel_size=3, padding=1, bias=False),
+#             nn.BatchNorm2d(out_channels * BasicBlock.expansion)
+#         )
 
-        #shortcut
-        self.shortcut = nn.Sequential()
+#         #shortcut
+#         self.shortcut = nn.Sequential()
 
-        #the shortcut output dimension is not the same with residual function
-        #use 1*1 convolution to match the dimension
-        if stride != 1 or in_channels != BasicBlock.expansion * out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels * BasicBlock.expansion, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels * BasicBlock.expansion)
-            )
+#         #the shortcut output dimension is not the same with residual function
+#         #use 1*1 convolution to match the dimension
+#         if stride != 1 or in_channels != BasicBlock.expansion * out_channels:
+#             self.shortcut = nn.Sequential(
+#                 nn.Conv2d(in_channels, out_channels * BasicBlock.expansion, kernel_size=1, stride=stride, bias=False),
+#                 nn.BatchNorm2d(out_channels * BasicBlock.expansion)
+#             )
 
-    def forward(self, x):
-        return nn.LeakyReLU(inplace=True)(self.residual_function(x) + self.shortcut(x))
+#     def forward(self, x):
+#         return nn.LeakyReLU(inplace=True)(self.residual_function(x) + self.shortcut(x))
 
 
 class PyramidDepthEstimation(nn.Module):
@@ -610,10 +611,12 @@ def doubleconv2d(in_channels, out_channels):
     return nn.Sequential(
             nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
-            nn.Tanh(),
+            # nn.Tanh(),
+            nn.LeakyReLU(),
             nn.Conv2d(in_channels=out_channels, out_channels=out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
-            nn.Tanh()
+            # nn.Tanh()
+            nn.LeakyReLU()
         )
 
 def doublefc1d(in_channels, out_channels):
@@ -837,13 +840,16 @@ class Finetune(nn.Module):
         self.finetune_compress = nn.Sequential(
             nn.Conv2d(in_channels=32, out_channels=16, kernel_size=1),
             nn.BatchNorm2d(16),
-            nn.Tanh(),
+            # nn.Tanh(),
+            nn.LeakyReLU(),
             nn.Conv2d(in_channels=16, out_channels=16, kernel_size=1),
             nn.BatchNorm2d(16),
-            nn.Tanh(),
+            # nn.Tanh(),
+            nn.LeakyReLU(),
             nn.Conv2d(in_channels=16, out_channels=1, kernel_size=1),
             nn.BatchNorm2d(1),
-            nn.Tanh()
+            # nn.Tanh()
+            nn.LeakyReLU()
         )
         self.maxpool = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
 
@@ -1058,46 +1064,54 @@ class FullConnected_baseline(nn.Module):
 class Conv_1d(nn.Module):
     def __init__(self):
         super(Conv_1d, self).__init__()
+        self.w_layers = 128
         self.layer1 = nn.Sequential(
             nn.Conv1d(in_channels=296, out_channels=512, kernel_size=1),
             nn.BatchNorm1d(512),
-            nn.Tanh(),
+            # nn.Tanh(),
+            nn.LeakyReLU(),
             nn.Conv1d(in_channels=512, out_channels=512, kernel_size=1),
             nn.BatchNorm1d(512),
-            nn.Tanh()
+            # nn.Tanh(),
+            nn.LeakyReLU(),
+            nn.Conv1d(in_channels=512, out_channels=512, kernel_size=1),
+            nn.BatchNorm1d(512)
         )
         self.layer1_res = nn.Sequential(
             nn.Conv1d(in_channels=296, out_channels=512, kernel_size=1),
-            nn.BatchNorm1d(512),
-            nn.Tanh()
+            nn.BatchNorm1d(512)
         )
 
         self.layer2 = nn.Sequential(
-            nn.Conv1d(in_channels=512, out_channels=256, kernel_size=1),
-            nn.BatchNorm1d(256),
-            nn.Tanh(),
-            nn.Conv1d(in_channels=256, out_channels=256, kernel_size=1),
-            nn.BatchNorm1d(256),
-            nn.Tanh()
+            nn.Conv1d(in_channels=512, out_channels=self.w_layers, kernel_size=1),
+            nn.BatchNorm1d(self.w_layers),
+            # nn.Tanh(),
+            nn.LeakyReLU(),
+            nn.Conv1d(in_channels=self.w_layers, out_channels=self.w_layers, kernel_size=1),
+            nn.BatchNorm1d(self.w_layers),
+            # nn.Tanh(),
+            nn.LeakyReLU(),
+            nn.Conv1d(in_channels=self.w_layers, out_channels=self.w_layers, kernel_size=1),
+            nn.BatchNorm1d(self.w_layers)
         )
         self.layer2_res = nn.Sequential(
-            nn.Conv1d(in_channels=512, out_channels=256, kernel_size=1),
-            nn.BatchNorm1d(256),
-            nn.Tanh()
+            nn.Conv1d(in_channels=512, out_channels=self.w_layers, kernel_size=1),
+            nn.BatchNorm1d(self.w_layers)
         )
         self.batch512 = nn.BatchNorm1d(512)
         self.batch256 = nn.BatchNorm1d(256)
     
     def forward(self, input):
         res1 = self.layer1(input) + self.layer1_res(input)
-        res1 = self.batch512(res1)
-        res1 = nn.Tanh()(res1)
+        # res1 = nn.Tanh()(res1)
+        res1 = nn.LeakyReLU()(res1)
 
         res2 = self.layer2(res1) + self.layer2_res(res1)
-        res2 = self.batch256(res2)
-        res2 = nn.Tanh()(res2)
+        # res2 = nn.Tanh()(res2)
+        res2 = nn.LeakyReLU()(res2)
 
         return res2
+
 
 class FeatureExtractionNet_Change(nn.Module):
     def __init__(self):
@@ -1152,3 +1166,205 @@ class FeatureExtractionNet_Change(nn.Module):
         x = self.add_channel(x)
 
         return x
+
+
+def convbn(in_planes, out_planes, kernel_size, stride, pad, dilation):
+
+    return nn.Sequential(nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=dilation if dilation > 1 else pad, dilation = dilation, bias=False),
+                         nn.BatchNorm2d(out_planes))
+
+
+def convbn_3d(in_planes, out_planes, kernel_size, stride, pad):
+
+    return nn.Sequential(nn.Conv3d(in_planes, out_planes, kernel_size=kernel_size, padding=pad, stride=stride,bias=False),
+                         nn.BatchNorm3d(out_planes))
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, inplanes, planes, stride, downsample, pad, dilation):
+        super(BasicBlock, self).__init__()
+
+        self.conv1 = nn.Sequential(convbn(inplanes, planes, 3, stride, pad, dilation),
+                                   nn.ReLU(inplace=True))
+
+        self.conv2 = convbn(planes, planes, 3, 1, pad, dilation)
+
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.conv2(out)
+
+        if self.downsample is not None:
+            x = self.downsample(x)
+
+        out += x
+
+        return out
+
+
+class feature_extraction(nn.Module):
+    def __init__(self):
+        super(feature_extraction, self).__init__()
+        self.inplanes = 32
+        self.firstconv = nn.Sequential(convbn(3, 32, 3, 1, 1, 1),
+                                       nn.ReLU(inplace=True),
+                                       convbn(32, 32, 3, 1, 1, 1),
+                                       nn.ReLU(inplace=True),
+                                       convbn(32, 32, 3, 1, 1, 1),
+                                       nn.ReLU(inplace=True))
+
+        self.layer1 = self._make_layer(BasicBlock, 32, 3, 1,1,1)
+        self.layer2 = self._make_layer(BasicBlock, 64, 16, 1,1,1) 
+        self.layer3 = self._make_layer(BasicBlock, 128, 3, 1,1,1)
+        self.layer4 = self._make_layer(BasicBlock, 128, 3, 1,1,2)
+
+        self.branch1 = nn.Sequential(nn.AvgPool2d((64, 64), stride=(64,64)),
+                                     convbn(128, 32, 1, 1, 0, 1),
+                                     nn.ReLU(inplace=True))
+
+        self.branch2 = nn.Sequential(nn.AvgPool2d((32, 32), stride=(32,32)),
+                                     convbn(128, 32, 1, 1, 0, 1),
+                                     nn.ReLU(inplace=True))
+
+        self.branch3 = nn.Sequential(nn.AvgPool2d((16, 16), stride=(16,16)),
+                                     convbn(128, 32, 1, 1, 0, 1),
+                                     nn.ReLU(inplace=True))
+
+        self.branch4 = nn.Sequential(nn.AvgPool2d((8, 8), stride=(8,8)),
+                                     convbn(128, 32, 1, 1, 0, 1),
+                                     nn.ReLU(inplace=True))
+
+        self.lastconv = nn.Sequential(convbn(320, 128, 3, 1, 1, 1),
+                                      nn.ReLU(inplace=True),
+                                      nn.Conv2d(128, 256, kernel_size=1, padding=0, stride = 1, bias=False))
+
+    def _make_layer(self, block, planes, blocks, stride, pad, dilation):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+           downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),)
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample, pad, dilation))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes,1,None,pad,dilation))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        output      = self.firstconv(x)
+        output      = self.layer1(output)
+        output_raw  = self.layer2(output)
+        output      = self.layer3(output_raw)
+        output_skip = self.layer4(output)
+
+
+        output_branch1 = self.branch1(output_skip)
+        output_branch1 = F.upsample(output_branch1, (output_skip.size()[2],output_skip.size()[3]),mode='bilinear')
+
+        output_branch2 = self.branch2(output_skip)
+        output_branch2 = F.upsample(output_branch2, (output_skip.size()[2],output_skip.size()[3]),mode='bilinear')
+
+        output_branch3 = self.branch3(output_skip)
+        output_branch3 = F.upsample(output_branch3, (output_skip.size()[2],output_skip.size()[3]),mode='bilinear')
+
+        output_branch4 = self.branch4(output_skip)
+        output_branch4 = F.upsample(output_branch4, (output_skip.size()[2],output_skip.size()[3]),mode='bilinear')
+
+        output_feature = torch.cat((output_raw, output_skip, output_branch4, output_branch3, output_branch2, output_branch1), 1)
+        output_feature = self.lastconv(output_feature)
+
+        return output_feature
+
+
+class FinetuneDistribution(nn.Module):
+    def __init__(self):
+        super(FinetuneDistribution, self).__init__()
+        self.Mlayers = 401
+        self.start = -4
+        self.stop = 4
+        self.fixed = np.array([i * ((self.stop-self.start) / (self.Mlayers-1)) + self.start for i in range(self.Mlayers)]).reshape(1, self.Mlayers, 1, 1)
+        # self.fixed = torch.from_numpy(self.fixed).expand(1, 69312, self.Mlayers).permute(0, 2, 1).reshape(1, self.Mlayers, 228, 304)
+        self.fixed = torch.from_numpy(self.fixed).to(device, dtype=torch.float32)
+        self.fixed = nn.Parameter(data=self.fixed, requires_grad=False)
+
+        self.finetune_down1 = doubleconv2d(4, 32)
+        self.finetune_down2 = doubleconv2d(32, 64)
+        self.finetune_down3 = doubleconv2d(64, 128)
+        self.finetune_down4 = doubleconv2d(128, 256)
+        self.finetune_down5 = doubleconv2d(256, 512)
+
+        self.finetune_up1 = doubleconv2d(512+256, 256)
+        self.finetune_up2 = doubleconv2d(256+128, 128)
+        self.finetune_up3 = doubleconv2d(128+64, 64)
+        self.finetune_up4 = doubleconv2d(64+32, 32)
+
+        self.finetune_addlayers = nn.Sequential(
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(),
+            nn.Conv2d(in_channels=64, out_channels=128, kernel_size=1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(),
+            nn.Conv2d(in_channels=128, out_channels=401, kernel_size=1),
+            nn.BatchNorm2d(401)
+        )
+        self.maxpool = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
+
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, rgb, init_depth):
+        input = torch.cat((rgb, init_depth), dim=1)
+
+        out1 = self.finetune_down1(input)
+        x = self.maxpool(out1)
+
+        out2 = self.finetune_down2(x)
+        x = self.maxpool(out2)
+
+        out3 = self.finetune_down3(x)
+        x = self.maxpool(out3)
+
+        out4 = self.finetune_down4(x)
+        x = self.maxpool(out4)
+
+        out5 = self.finetune_down5(x)
+
+        x = nn.functional.interpolate(out5, (out4.size()[2], out4.size()[3]), mode='bilinear', align_corners=True)
+        x = torch.cat((x, out4), dim=1)
+        x = self.finetune_up1(x)
+
+        x = nn.functional.interpolate(x, (out3.size()[2], out3.size()[3]), mode='bilinear', align_corners=True)
+        x = torch.cat((x, out3), dim=1)
+        x = self.finetune_up2(x)
+
+        x = nn.functional.interpolate(x, (out2.size()[2], out2.size()[3]), mode='bilinear', align_corners=True)
+        x = torch.cat((x, out2), dim=1)
+        x = self.finetune_up3(x)
+
+        x = nn.functional.interpolate(x, (out1.size()[2], out1.size()[3]), mode='bilinear', align_corners=True)
+        x = torch.cat((x, out1), dim=1)
+        x = self.finetune_up4(x)
+
+        x = self.finetune_addlayers(x)
+        x = self.softmax(x) # 1x401x228x304
+
+        output = F.conv2d(x, self.fixed)
+
+        # x = x.reshape(self.Mlayers, 69312).permute(1, 0)
+        # output = torch.matmul(x, self.fixed).reshape(1, 1, 228, 304)
+
+        return x, (output + init_depth)
+
+
+# if __name__ == "__main__":
+#     f_e_net = feature_extraction()
+#     img = torch.rand(1, 3, 228, 304)
+#     out = f_e_net(img)
+#     print(out.size())

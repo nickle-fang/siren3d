@@ -18,7 +18,7 @@ server_pos = "../SSD"
 use_pos = server_pos
 if (use_pos == server_pos):
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -271,6 +271,7 @@ class SamplePoint_update(object):
         rgb = sample['rgb']
 
         rgb = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))(rgb)
+        # depth = transforms.Normalize([0.5], [0.5])(depth)
 
         disp_mask = depth > 0
 
